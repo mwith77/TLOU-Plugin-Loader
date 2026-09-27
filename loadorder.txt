@@ -1,0 +1,10 @@
+; loadorder.txt - the order plugins load in
+;
+; One plugin per line, named by its mod folder or by its DLL's file name.
+; Listed plugins load first, in this order; the rest load after them, sorted by
+; DLL file name.
+;
+; Lines beginning with ; or # are ignored.
+
+mod_menu_framework.dll
+inventory_and_pickups_modifier.dll
