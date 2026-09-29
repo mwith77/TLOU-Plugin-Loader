@@ -1,0 +1,33 @@
+#include <winver.h>
+
+/* The version resource for the real loader. Bump the version here when the
+   loader is released. */
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    1,0,0,0
+ PRODUCTVERSION 1,0,0,0
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+ FILEFLAGS      0x0L
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_DLL
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName",      "mwith77"
+            VALUE "FileDescription",  "TLOU Plugin Loader"
+            VALUE "FileVersion",      "v1.0.0"
+            VALUE "InternalName",     "tlou_plugin_loader"
+            VALUE "LegalCopyright",   "mwith77"
+            VALUE "OriginalFilename", "tlou_plugin_loader.dll"
+            VALUE "ProductName",      "TLOU Plugin Loader"
+            VALUE "ProductVersion",   "v1.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

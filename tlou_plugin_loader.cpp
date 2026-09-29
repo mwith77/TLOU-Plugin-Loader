@@ -25,8 +25,8 @@
 static char global_gameDir[MAX_PATH];
 static char global_modsDir[MAX_PATH];
 static char global_logsDir[MAX_PATH];
-/* The folder this DLL is in, a folder of its own under Mods. Holds
-   tlou_plugin_loader.ini, Logs and Cache. */
+/* The loader's own folder, Mods\Plugin Loader, which is where the DLL lives.
+   Holds tlou_plugin_loader.ini, Logs and Cache. */
 static char global_ownFolder[MAX_PATH];
 static char global_logPath[MAX_PATH];
 static char global_iniPath[MAX_PATH];
@@ -1411,6 +1411,83 @@ static void loadAll() {
     }
 }
 
+/* --------------------------------------------------------------------------
+   Loading the plugins at the right point in the game's start
+
+   As version.dll the loader attaches while the game is still starting, before
+   the game's own code runs. A plugin can need the game a certain way into its
+   start: the framework enlarges the game's text cache, which has to exist by
+   then, and adds its entry to the menus, which must not be built yet. When the
+   launcher injected the loader it landed in that window; loading after a fixed
+   wait would land there only on the hardware the wait was timed for.
+
+   The loader reaches the same point by waiting, in the game's own sequence,
+   until the game's code is decrypted and in place - it polls the read-only data
+   for a known signature, which appears only then, the same point the launcher's
+   settle used to reach and before the game has built its menus. It then loads
+   the plugins on its own thread; the loading is heavy, parses menu files and
+   places hooks, and stays off the game's thread. There is no fixed wait, so it
+   holds on any hardware.
+   -------------------------------------------------------------------------- */
+
+static const char* const listenerUpdateSignature =
+    "void __cdecl ScriptManager::ListenerUpdate(void)";
+
+static volatile LONG global_pluginsLoaded = 0;
+
+/* Discovers and loads the plugins, once however many times it is called. */
+static void loadPluginsOnce() {
+    if (InterlockedCompareExchange(&global_pluginsLoaded, 1, 0) != 0) return;
+    discover();
+    if (global_candCount > 1)
+        qsort(global_cand, global_candCount, sizeof(Candidate), compareCandidates);
+    loadAll();
+}
+
+#define GAME_CODE_POLL_MS  100
+#define GAME_CODE_CAP_MS   120000
+
+/* Whether the game's read-only data holds this signature. Reading it while the
+   executable is still being decrypted can fault, which counts as not yet in
+   place. */
+static int readOnlyDataHas(const char* signature) {
+    int found = 0;
+    GUARD_TRY {
+        unsigned char* base = (unsigned char*)global_gameModuleBase;
+        IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
+        IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(base + dos->e_lfanew);
+        if (base && dos->e_magic == IMAGE_DOS_SIGNATURE
+            && nt->Signature == IMAGE_NT_SIGNATURE) {
+            const size_t sigLen = strlen(signature);
+            IMAGE_SECTION_HEADER* sh = IMAGE_FIRST_SECTION(nt);
+            for (int i = 0; i < nt->FileHeader.NumberOfSections && !found; ++i) {
+                if (sh[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) continue;
+                if (!(sh[i].Characteristics & IMAGE_SCN_MEM_READ)) continue;
+                unsigned char* p = base + sh[i].VirtualAddress;
+                const size_t n = sh[i].Misc.VirtualSize;
+                if (n < sigLen + 1) continue;
+                for (size_t o = 0; o + sigLen + 1 <= n; ++o)
+                    if (p[o] == (unsigned char)signature[0]
+                        && memcmp(p + o, signature, sigLen + 1) == 0) {
+                        found = 1;
+                        break;
+                    }
+            }
+        }
+    } GUARD_EXCEPT { found = 0; }
+    return found;
+}
+
+/* Waits until the game's read-only data is in place, so the finder can work. */
+static void waitForGameCode() {
+    for (int waited = 0; waited < GAME_CODE_CAP_MS; waited += GAME_CODE_POLL_MS) {
+        if (readOnlyDataHas(listenerUpdateSignature)) return;
+        Sleep(GAME_CODE_POLL_MS);
+    }
+    writeLog("the game's read-only data was not in place within %d ms, so the "
+             "hooks may not be found", GAME_CODE_CAP_MS);
+}
+
 static DWORD WINAPI start(LPVOID) {
     if (!describeGame()) { writeLog("could not describe the game module"); return 1; }
 
@@ -1422,10 +1499,10 @@ static DWORD WINAPI start(LPVOID) {
     }
     prepareHookSlots();
 
-    discover();
-    if (global_candCount > 1)
-        qsort(global_cand, global_candCount, sizeof(Candidate), compareCandidates);
-    loadAll();
+    /* Wait, in the game's own sequence, for its code to be decrypted and in
+       place - the point the launcher's settle used to reach - then load. */
+    waitForGameCode();
+    loadPluginsOnce();
     return 0;
 }
 
