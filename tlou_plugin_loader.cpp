@@ -14,6 +14,16 @@
 
 #pragma comment(lib, "version.lib")
 
+/* The loader's version, for its own log lines. Keep it the same as
+   tlou_plugin_loader.rc. */
+#define LOADER_VERSION "v1.0.1"
+
+/* Lines of normal function, used by the beta test (v1.0.1_beta_1): the
+   program the loader finds itself in when that is not the game, and how long
+   the game's code took to be in place. 0 in a release, which logs only
+   failures. */
+#define LOADER_BETA_LINES 0
+
 #if defined(_MSC_VER)
 #define GUARD_TRY    __try
 #define GUARD_EXCEPT __except (EXCEPTION_EXECUTE_HANDLER)
@@ -1412,6 +1422,173 @@ static void loadAll() {
 }
 
 /* --------------------------------------------------------------------------
+   The game only
+
+   Windows loads version.dll from the game folder into every program there
+   that imports it, not only into the game. The game's crash reporter,
+   crs-handler.exe, imports it and runs beside the game from a few seconds into
+   every session, so it loaded the loader too, and two minutes later the
+   plugins. The loader now works only in the game's own executables; in any
+   other program it does nothing: it does not move the log aside, watch for
+   crashes, or load plugins.
+   -------------------------------------------------------------------------- */
+
+static const wchar_t* const gamePrograms[] = { L"tlou-i.exe", L"tlou-i-l.exe" };
+
+/* The file name of the program this process runs. Empty when it cannot be
+   read. */
+static void programName(wchar_t* out, size_t room) {
+    wchar_t path[MAX_PATH];
+    out[0] = 0;
+    const DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) return;
+    const wchar_t* slash = wcsrchr(path, L'\\');
+    wcsncpy_s(out, room, slash ? slash + 1 : path, _TRUNCATE);
+}
+
+/* Whether this process runs one of the game's own executables. */
+static int inTheGame() {
+    wchar_t name[MAX_PATH];
+    programName(name, MAX_PATH);
+    for (const wchar_t* game : gamePrograms)
+        if (_wcsicmp(name, game) == 0) return 1;
+    return 0;
+}
+
+/* A wide string as UTF-8, on the heap, for the log; the caller frees it. Null
+   when it cannot be converted. */
+static char* utf8Copy(const wchar_t* text) {
+    if (!text) return nullptr;
+    const int need = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0,
+                                         nullptr, nullptr);
+    if (need <= 0) return nullptr;
+    char* out = (char*)malloc((size_t)need);
+    if (!out) return nullptr;
+    if (!WideCharToMultiByte(CP_UTF8, 0, text, -1, out, need, nullptr, nullptr)) {
+        free(out);
+        return nullptr;
+    }
+    return out;
+}
+
+/* A FILETIME as one number of 100 ns units. */
+static unsigned long long fileTimeNumber(const FILETIME& when) {
+    ULARGE_INTEGER number;
+    number.LowPart = when.dwLowDateTime;
+    number.HighPart = when.dwHighDateTime;
+    return number.QuadPart;
+}
+
+/* When this process was created, or 0 when that cannot be read. */
+static unsigned long long thisProcessCreated() {
+    FILETIME created, ended, kernel, user;
+    if (!GetProcessTimes(GetCurrentProcess(), &created, &ended, &kernel, &user))
+        return 0;
+    return fileTimeNumber(created);
+}
+
+/*
+    The process that started this one, by the process list: its id and its
+    program's file name.
+
+    parentId    the id, or 0 when it cannot be read
+    parentName  the file name; empty when that process has ended, or when its
+                id now belongs to a program started after this one
+*/
+static void parentOfThisProcess(DWORD* parentId, wchar_t* parentName,
+                                size_t room) {
+    *parentId = 0;
+    parentName[0] = 0;
+    const DWORD mine = GetCurrentProcessId();
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return;
+
+    PROCESSENTRY32W entry;
+    entry.dwSize = sizeof(entry);
+    if (Process32FirstW(snapshot, &entry)) {
+        do {
+            if (entry.th32ProcessID == mine) {
+                *parentId = entry.th32ParentProcessID;
+                break;
+            }
+        } while (Process32NextW(snapshot, &entry));
+    }
+    if (*parentId) {
+        entry.dwSize = sizeof(entry);
+        if (Process32FirstW(snapshot, &entry)) {
+            do {
+                if (entry.th32ProcessID == *parentId) {
+                    wcsncpy_s(parentName, room, entry.szExeFile, _TRUNCATE);
+                    break;
+                }
+            } while (Process32NextW(snapshot, &entry));
+        }
+    }
+    CloseHandle(snapshot);
+
+    /* A process under that id created after this one is another program that
+       took the id once the parent ended. */
+    if (parentName[0]) {
+        HANDLE parent = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                                    *parentId);
+        if (parent) {
+            FILETIME created, ended, kernel, user;
+            const unsigned long long mineCreated = thisProcessCreated();
+            if (mineCreated
+                && GetProcessTimes(parent, &created, &ended, &kernel, &user)
+                && fileTimeNumber(created) > mineCreated)
+                parentName[0] = 0;
+            CloseHandle(parent);
+        }
+    }
+}
+
+/* Writes which program this process runs, what started it, and its command
+   line. Each line opens with lead. */
+static void logThisProcess(const char* lead) {
+    wchar_t name[MAX_PATH], parentName[MAX_PATH];
+    DWORD parentId = 0;
+    programName(name, MAX_PATH);
+    parentOfThisProcess(&parentId, parentName, MAX_PATH);
+
+    unsigned long long runningMs = 0;
+    const unsigned long long created = thisProcessCreated();
+    FILETIME now;
+    GetSystemTimeAsFileTime(&now);
+    if (created && fileTimeNumber(now) > created)
+        runningMs = (fileTimeNumber(now) - created) / 10000;
+
+    char* nameText = utf8Copy(name);
+    char* parentText = utf8Copy(parentName);
+    char* commandLine = utf8Copy(GetCommandLineW());
+    const char* shownName = nameText && *nameText ? nameText
+                                                  : "a program of unknown name";
+    if (parentText && *parentText)
+        writeLog("%sit is %s, process %lu, started %llu ms ago by %s "
+                 "(process %lu)", lead, shownName, GetCurrentProcessId(),
+                 runningMs, parentText, parentId);
+    else
+        writeLog("%sit is %s, process %lu, started %llu ms ago by process %lu, "
+                 "which has since ended", lead, shownName,
+                 GetCurrentProcessId(), runningMs, parentId);
+    writeLog("%sits command line: %s", lead,
+             commandLine ? commandLine : "(not readable)");
+    free(nameText);
+    free(parentText);
+    free(commandLine);
+}
+
+#if LOADER_BETA_LINES
+/* The beta's note, in a program that is not the game, of which program it is. */
+static DWORD WINAPI noteOtherProgram(LPVOID) {
+    writeLog("TLOU Plugin Loader " LOADER_VERSION " was loaded by a program that "
+             "is not the game, and does nothing in it");
+    logThisProcess("  ");
+    return 0;
+}
+#endif
+
+/* --------------------------------------------------------------------------
    Loading the plugins at the right point in the game's start
 
    As version.dll the loader attaches while the game is still starting, before
@@ -1421,13 +1598,17 @@ static void loadAll() {
    launcher injected the loader it landed in that window; loading after a fixed
    wait would land there only on the hardware the wait was timed for.
 
-   The loader reaches the same point by waiting, in the game's own sequence,
-   until the game's code is decrypted and in place - it polls the read-only data
-   for a known signature, which appears only then, the same point the launcher's
-   settle used to reach and before the game has built its menus. It then loads
-   the plugins on its own thread; the loading is heavy, parses menu files and
-   places hooks, and stays off the game's thread. There is no fixed wait, so it
-   holds on any hardware.
+   The loader waits until the game's code is in place - it polls the read-only
+   data for a known signature - and then loads the plugins on its own thread;
+   the loading is heavy, parses menu files and places hooks, and stays off the
+   game's thread. There is no fixed wait, so it holds on any hardware.
+
+   The copy of tlou-i.exe on disk holds its code and this signature in plain
+   form, and in v1.0.1_beta_1's test (2026-10-01) the wait passed at its first
+   check, 0 ms in: nothing decrypts the game's code after it starts. The wait
+   stays as a safety net. Should the signature never appear, it runs out and no
+   plugins are loaded: a plugin's view of the game would be wrong in a process
+   whose code is not the game's.
    -------------------------------------------------------------------------- */
 
 static const char* const listenerUpdateSignature =
@@ -1447,9 +1628,31 @@ static void loadPluginsOnce() {
 #define GAME_CODE_POLL_MS  100
 #define GAME_CODE_CAP_MS   120000
 
-/* Whether the game's read-only data holds this signature. Reading it while the
-   executable is still being decrypted can fault, which counts as not yet in
-   place. */
+/* Whether every page from first for size bytes can be read now. Asking first,
+   rather than reading and catching the fault, keeps the check out of the crash
+   lines. */
+static int canRead(const unsigned char* first, size_t size) {
+    const unsigned char* at = first;
+    const unsigned char* end = first + size;
+    const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY
+                         | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE
+                         | PAGE_EXECUTE_WRITECOPY;
+    while (at < end) {
+        MEMORY_BASIC_INFORMATION about;
+        if (VirtualQuery(at, &about, sizeof(about)) != sizeof(about)) return 0;
+        if (about.State != MEM_COMMIT) return 0;
+        if (about.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
+        if (!(about.Protect & readable)) return 0;
+        const unsigned char* next = (const unsigned char*)about.BaseAddress
+                                  + about.RegionSize;
+        if (next <= at) return 0;
+        at = next;
+    }
+    return 1;
+}
+
+/* Whether the game's read-only data holds this signature. A section that
+   cannot be read yet counts as not in place. */
 static int readOnlyDataHas(const char* signature) {
     int found = 0;
     GUARD_TRY {
@@ -1466,6 +1669,7 @@ static int readOnlyDataHas(const char* signature) {
                 unsigned char* p = base + sh[i].VirtualAddress;
                 const size_t n = sh[i].Misc.VirtualSize;
                 if (n < sigLen + 1) continue;
+                if (!canRead(p, n)) continue;
                 for (size_t o = 0; o + sigLen + 1 <= n; ++o)
                     if (p[o] == (unsigned char)signature[0]
                         && memcmp(p + o, signature, sigLen + 1) == 0) {
@@ -1478,14 +1682,87 @@ static int readOnlyDataHas(const char* signature) {
     return found;
 }
 
-/* Waits until the game's read-only data is in place, so the finder can work. */
-static void waitForGameCode() {
-    for (int waited = 0; waited < GAME_CODE_CAP_MS; waited += GAME_CODE_POLL_MS) {
-        if (readOnlyDataHas(listenerUpdateSignature)) return;
+/* The beta's line saying at which check the game's code was in place. */
+static void noteGameCodeInPlace(int check, ULONGLONG waitedMs) {
+#if LOADER_BETA_LINES
+    writeLog("TLOU Plugin Loader " LOADER_VERSION " in %s, process %lu: the "
+             "game's code was in place at check %d, %llu ms into the wait",
+             global_exeName, GetCurrentProcessId(), check,
+             (unsigned long long)waitedMs);
+#else
+    (void)check;
+    (void)waitedMs;
+#endif
+}
+
+/* Waits until the game's read-only data is in place, so the finder can work.
+   Answers 1 when it is, 0 when the wait ran out. */
+static int waitForGameCode() {
+    const ULONGLONG began = GetTickCount64();
+    const int checks = GAME_CODE_CAP_MS / GAME_CODE_POLL_MS;
+    for (int check = 1; check <= checks; ++check) {
+        if (readOnlyDataHas(listenerUpdateSignature)) {
+            noteGameCodeInPlace(check, GetTickCount64() - began);
+            return 1;
+        }
         Sleep(GAME_CODE_POLL_MS);
     }
-    writeLog("the game's read-only data was not in place within %d ms, so the "
-             "hooks may not be found", GAME_CODE_CAP_MS);
+    return 0;
+}
+
+static const char* protectionName(DWORD protect) {
+    switch (protect & 0xFF) {
+        case PAGE_NOACCESS:          return "no access";
+        case PAGE_READONLY:          return "read";
+        case PAGE_READWRITE:         return "read-write";
+        case PAGE_WRITECOPY:         return "read-write (copy on write)";
+        case PAGE_EXECUTE:           return "execute";
+        case PAGE_EXECUTE_READ:      return "execute-read";
+        case PAGE_EXECUTE_READWRITE: return "execute-read-write";
+        case PAGE_EXECUTE_WRITECOPY: return "execute-read-write (copy on write)";
+        default:                     return "an unknown protection";
+    }
+}
+
+/* One line naming each section of the game's image and how its memory can be
+   used now, opened with lead. */
+static void logSections(const char* lead) {
+    char line[1024];
+    size_t used = 0;
+    line[0] = 0;
+    GUARD_TRY {
+        unsigned char* base = (unsigned char*)global_gameModuleBase;
+        IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
+        IMAGE_NT_HEADERS64* nt = (IMAGE_NT_HEADERS64*)(base + dos->e_lfanew);
+        IMAGE_SECTION_HEADER* sh = IMAGE_FIRST_SECTION(nt);
+        for (int i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+            char name[9];
+            memcpy(name, sh[i].Name, 8);
+            name[8] = 0;
+            MEMORY_BASIC_INFORMATION about;
+            memset(&about, 0, sizeof(about));
+            const char* state = "not readable";
+            const char* guard = "";
+            if (VirtualQuery(base + sh[i].VirtualAddress, &about, sizeof(about))
+                == sizeof(about)) {
+                if (about.State == MEM_COMMIT) {
+                    state = protectionName(about.Protect);
+                    if (about.Protect & PAGE_GUARD) guard = ", guarded";
+                } else if (about.State == MEM_RESERVE) {
+                    state = "reserved, not committed";
+                } else {
+                    state = "free";
+                }
+            }
+            const int wrote = _snprintf_s(line + used, sizeof(line) - used,
+                                          _TRUNCATE, "%s%s %s%s",
+                                          used ? "; " : "", name, state, guard);
+            if (wrote < 0) break;
+            used += (size_t)wrote;
+        }
+    } GUARD_EXCEPT { }
+    writeLog("%sits sections now: %s", lead,
+             line[0] ? line : "(its header could not be read)");
 }
 
 static DWORD WINAPI start(LPVOID) {
@@ -1499,9 +1776,16 @@ static DWORD WINAPI start(LPVOID) {
     }
     prepareHookSlots();
 
-    /* Wait, in the game's own sequence, for its code to be decrypted and in
-       place - the point the launcher's settle used to reach - then load. */
-    waitForGameCode();
+    /* Wait for the game's code to be in place, then load. */
+    if (!waitForGameCode()) {
+        writeLog("the game's code was not in place within %d s: its read-only "
+                 "data never held the signature \"%s\", so no plugins are loaded "
+                 "into this process", GAME_CODE_CAP_MS / 1000,
+                 listenerUpdateSignature);
+        logThisProcess("  ");
+        logSections("  ");
+        return 0;
+    }
     loadPluginsOnce();
     return 0;
 }
@@ -1557,6 +1841,17 @@ BOOL APIENTRY DllMain(HMODULE self, DWORD reason, LPVOID) {
                        "%s\\tlou_plugin_loader.ini", global_ownFolder))
         return TRUE;
 
+    /* In a program that is not the game - the game's crash reporter - the
+       loader does nothing: no log moved aside, no crash watch, no plugins. */
+    if (!inTheGame()) {
+#if LOADER_BETA_LINES
+        const HANDLE note = CreateThread(nullptr, 0, noteOtherProgram, nullptr,
+                                         0, nullptr);
+        if (note) CloseHandle(note);
+#endif
+        return TRUE;
+    }
+
     /* Each level must exist before the next can be created. */
     CreateDirectoryA(global_modsDir, nullptr);
     CreateDirectoryA(global_ownFolder, nullptr);
@@ -1566,6 +1861,7 @@ BOOL APIENTRY DllMain(HMODULE self, DWORD reason, LPVOID) {
     global_logLockReady = true;
     watchForCrashes();
 
-    CreateThread(nullptr, 0, start, nullptr, 0, nullptr);
+    const HANDLE thread = CreateThread(nullptr, 0, start, nullptr, 0, nullptr);
+    if (thread) CloseHandle(thread);
     return TRUE;
 }

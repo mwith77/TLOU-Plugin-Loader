@@ -7,7 +7,7 @@ the system copy and loads `tlou_plugin_loader.dll`, which loads a DLL from each
 mod's folder under the game's `Mods` folder. The game is started normally, from
 Steam. No file of the game's own is changed.
 
-Version 1.0.0, for `tlou-i.exe` 1.1.5.0.
+Version 1.0.1, for `tlou-i.exe` 1.1.5.0.
 
 ## Files
 
@@ -37,7 +37,12 @@ Laid out as it goes into the game folder:
     Mods\Plugin Loader\             tlou_plugin_loader.dll and tlou_plugin_loader.ini
 
 Start the game normally, from Steam. `version.dll` never has to change once it is
-in place; later loader releases replace only `tlou_plugin_loader.dll`. Each mod
+in place; later loader releases replace only `tlou_plugin_loader.dll`.
+
+Windows also loads `version.dll` into the other programs in the game folder that
+import it, such as the game's crash reporter, `crs-handler.exe`. In them it only
+forwards the real `version.dll`; the loader does nothing outside the game's own
+executables, `tlou-i.exe` and `tlou-i-l.exe`. Each mod
 goes in a folder of its own under `Mods`; the loader loads the first DLL directly
 inside each folder under `Mods` other than its own.
 
