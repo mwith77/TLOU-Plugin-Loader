@@ -40,7 +40,9 @@
 
         [hook:NAME]
         rva=HEX
-        bytes=HEX pairs, no separators
+        bytes=HEX pairs, no separators: the first bytes at rva, read through
+              the source set by SetOriginalBytesSource, or as memory holds
+              them when none is set
         base=DECIMAL register number, -1 for none
         index=DECIMAL register number, -1 for none
         scale=1|2|4|8
@@ -604,6 +606,37 @@ static CacheEntry *cacheEntry(const char *name)
     return NULL;
 }
 
+/* ------------------------------------------------ bytes before patching */
+
+/* Set by SetOriginalBytesSource. NULL reads memory as it stands. */
+static OriginalBytesFn global_originalBytesSource = NULL;
+
+void SetOriginalBytesSource(OriginalBytesFn fn)
+{
+    global_originalBytesSource = fn;
+}
+
+/* The length bytes at address, read through the source set by
+   SetOriginalBytesSource, or as memory holds them when none is set, copied
+   into out. */
+static void readOriginalBytes(const unsigned char *address, size_t length,
+                              unsigned char *out)
+{
+    if (global_originalBytesSource) global_originalBytesSource(address, length, out);
+    else memcpy(out, address, length);
+}
+
+/* 1 when the length bytes at address, read as readOriginalBytes reads them,
+   equal expected. Answers 0 for a length over MAX_SEQ_BYTES. */
+static int matchesOriginalBytes(const unsigned char *address,
+                                const unsigned char *expected, size_t length)
+{
+    unsigned char before[MAX_SEQ_BYTES];
+    if (length > MAX_SEQ_BYTES) return 0;
+    readOriginalBytes(address, length, before);
+    return memcmp(before, expected, length) == 0;
+}
+
 /* ------------------------------------------------------------------- API */
 
 int Find(const Request *req, Site *out)
@@ -630,7 +663,7 @@ int Find(const Request *req, Site *out)
     if (ce) {
         unsigned char *addr = imageBase + ce->rva;
         if (ce->rva < id.sizeOfImage && ce->byteLen > 0 &&
-            memcmp(addr, ce->bytes, (size_t)ce->byteLen) == 0) {
+            matchesOriginalBytes(addr, ce->bytes, (size_t)ce->byteLen)) {
             out->address        = addr;
             out->rva            = ce->rva;
             out->addLength      = ce->addLen;
@@ -690,7 +723,8 @@ int Find(const Request *req, Site *out)
                 out->storeSrcReg    = c.storeSrcReg;
                 out->originalLength = c.sequenceLength < MAX_SEQ_BYTES
                                     ? c.sequenceLength : MAX_SEQ_BYTES;
-                memcpy(out->originalBytes, c.address, (size_t)out->originalLength);
+                readOriginalBytes(c.address, (size_t)out->originalLength,
+                                  out->originalBytes);
                 return 1;
             }
         } else {
@@ -752,7 +786,7 @@ int Find(const Request *req, Site *out)
     out->addDestReg     = c->addDestReg;
     out->storeSrcReg    = c->storeSrcReg;
     out->originalLength = seqLen;
-    memcpy(out->originalBytes, c->address, (size_t)seqLen);
+    readOriginalBytes(c->address, (size_t)seqLen, out->originalBytes);
 
     free(cands);
     (void)st;
@@ -898,6 +932,73 @@ static int functionRangeFor(unsigned char *base, unsigned int rva,
     return 0;
 }
 
+/*
+    A function the compiler split keeps each later part as an entry of its own
+    in the exception directory, and that part's unwind information leads back
+    to the entry before it. Followed to its end, the chain arrives at the
+    function's first part, where the function begins. The entry before is
+    reached in one of two ways:
+
+      unwind with bit 0 set       the RVA, less that bit, of the entry itself
+      UNWIND_INFO flag CHAININFO  a copy of the entry, placed after the unwind
+                                  codes: their count rounded up to an even
+                                  number, two bytes each
+
+    UNWIND_INFO: u8 version (bits 0-2) and flags (bits 3-7), u8 prologue size,
+    u8 count of codes, u8 frame register and offset, then the codes.
+
+    The function rva is part of, by the range of its first part. Returns 0 when
+    rva is outside every function, or when the chain leaves the image or does
+    not end within MAX_CHAIN_STEPS.
+*/
+#define UNWIND_FLAG_CHAININFO 0x04
+#define MAX_CHAIN_STEPS       16
+
+static int functionStartFor(unsigned char *base, unsigned int rva,
+                            unsigned int *beginOut, unsigned int *endOut)
+{
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
+    IMAGE_NT_HEADERS64 *nt = (IMAGE_NT_HEADERS64 *)(base + dos->e_lfanew);
+    const unsigned int imageSize = nt->OptionalHeader.SizeOfImage;
+    IMAGE_DATA_DIRECTORY *dir =
+        &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    if (!dir->VirtualAddress || dir->Size < sizeof(RUNTIME_FUNCTION)) return 0;
+
+    RUNTIME_FUNCTION *fn = (RUNTIME_FUNCTION *)(base + dir->VirtualAddress);
+    int n = (int)(dir->Size / sizeof(RUNTIME_FUNCTION));
+    const RUNTIME_FUNCTION *part = NULL;
+    int lo = 0, hi = n - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (rva < fn[mid].BeginAddress)      hi = mid - 1;
+        else if (rva >= fn[mid].EndAddress)  lo = mid + 1;
+        else { part = &fn[mid]; break; }
+    }
+    if (!part) return 0;
+
+    RUNTIME_FUNCTION entry = *part;
+    for (int step = 0;; ++step) {
+        if (step >= MAX_CHAIN_STEPS) return 0;
+        const unsigned int unwind = entry.UnwindData;
+        unsigned int before = 0;
+        if (unwind & 1u) {
+            before = unwind & ~1u;
+        } else {
+            if (unwind >= imageSize || imageSize - unwind < 4) return 0;
+            const unsigned char *info = base + unwind;
+            if (!((info[0] >> 3) & UNWIND_FLAG_CHAININFO)) break;
+            before = unwind + 4u + (((unsigned int)info[2] + 1u) & ~1u) * 2u;
+        }
+        if (before >= imageSize
+            || imageSize - before < sizeof(RUNTIME_FUNCTION)) return 0;
+        memcpy(&entry, base + before, sizeof(entry));
+    }
+    if (entry.EndAddress <= entry.BeginAddress) return 0;
+    *beginOut = entry.BeginAddress;
+    *endOut   = entry.EndAddress;
+    return 1;
+}
+
 int FindFunctionByName(const char *name, const char *signature, FunctionSite *out)
 {
     memset(out, 0, sizeof(*out));
@@ -920,16 +1021,26 @@ int FindFunctionByName(const char *name, const char *signature, FunctionSite *ou
     CacheEntry *ce = cacheEntry(name);
     if (ce && ce->rva && ce->byteLen > 0) {
         unsigned char *addr = imageBase + ce->rva;
-        if (memcmp(addr, ce->bytes, (size_t)ce->byteLen) == 0) {
+        /* An entry is taken only where the function begins. One written by an
+           earlier loader may hold a later part of a split function; it is
+           searched for again, and the search answers the function's start. */
+        unsigned int startRva = 0, startEnd = 0;
+        const int atStart = functionStartFor(imageBase, ce->rva, &startRva,
+                                             &startEnd)
+                            && startRva == ce->rva;
+        if (!atStart) {
+            ce->used = 0;
+        } else if (matchesOriginalBytes(addr, ce->bytes, (size_t)ce->byteLen)) {
             out->address   = addr;
             out->rva       = ce->rva;
             out->size      = (unsigned int)ce->seqLen;
             out->fromCache = 1;
             return 1;
+        } else {
+            emitLog("hook_finder [%s]: cache entry for rva %08X no longer "
+                    "matches; searching again", name, ce->rva);
+            ce->used = 0;
         }
-        emitLog("hook_finder [%s]: cache entry for rva %08X no longer matches; "
-                "searching again", name, ce->rva);
-        ce->used = 0;
     }
 
     IMAGE_SECTION_HEADER *sec = NULL;
@@ -962,7 +1073,9 @@ int FindFunctionByName(const char *name, const char *signature, FunctionSite *ou
         return 0;
     }
 
-    /* 2. lea instructions that point at it, and the functions they sit in */
+    /* 2. lea instructions that point at it, and the functions they sit in,
+          each counted by where it begins: a reference in a later part of a
+          split function counts as that function and answers its start */
     unsigned int beginRva = 0, endRva = 0, refs = 0, distinct = 0;
     for (int i = 0; i < secCount; ++i) {
         if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
@@ -978,7 +1091,7 @@ int FindFunctionByName(const char *name, const char *signature, FunctionSite *ou
             if (here + 7 + (unsigned int)disp != stringRva) continue;
             ++refs;
             unsigned int b = 0, e = 0;
-            if (!functionRangeFor(imageBase, here, &b, &e)) continue;
+            if (!functionStartFor(imageBase, here, &b, &e)) continue;
             if (beginRva && b == beginRva) continue;
             if (beginRva) { ++distinct; continue; }
             beginRva = b; endRva = e; distinct = 1;
@@ -998,8 +1111,10 @@ int FindFunctionByName(const char *name, const char *signature, FunctionSite *ou
     return 1;
 }
 
-/* Records a located function in the cache. The first bytes are the fingerprint
-   that a later cache hit is checked against. */
+/* Records a located function in the cache. The first bytes at rva, read
+   through the source set by SetOriginalBytesSource, or as memory holds them
+   when none is set, are the fingerprint that a later cache hit is checked
+   against. */
 void MarkFunctionVerified(const char *name, const FunctionSite *site)
 {
     HookState *st = stateForHook(name);
@@ -1031,7 +1146,7 @@ void MarkFunctionVerified(const char *name, const FunctionSite *site)
     if (keep > MAX_SEQ_BYTES) keep = MAX_SEQ_BYTES;
     ce->rva     = site->rva;
     ce->byteLen = keep;
-    memcpy(ce->bytes, site->address, (size_t)keep);
+    readOriginalBytes(site->address, (size_t)keep, ce->bytes);
     ce->baseReg = -1; ce->indexReg = -1; ce->scale = 1; ce->disp = 0;
     ce->addDest = -1; ce->storeSrc = -1;
     ce->addLen  = keep;

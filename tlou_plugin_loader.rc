@@ -1,11 +1,11 @@
 #include <winver.h>
 
-/* The version resource for the real loader. Bump the version here when the
-   loader is released. */
+/* The version resource for the loader, tlou_plugin_loader.asi. Bump the
+   version here when the loader is released. */
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION    1,0,1,0
- PRODUCTVERSION 1,0,1,0
+ FILEVERSION    1,1,0,0
+ PRODUCTVERSION 1,1,0,0
  FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
  FILEFLAGS      0x0L
  FILEOS         VOS_NT_WINDOWS32
@@ -18,12 +18,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "mwith77"
             VALUE "FileDescription",  "TLOU Plugin Loader"
-            VALUE "FileVersion",      "v1.0.1"
+            VALUE "FileVersion",      "v1.1.0"
             VALUE "InternalName",     "tlou_plugin_loader"
             VALUE "LegalCopyright",   "mwith77"
-            VALUE "OriginalFilename", "tlou_plugin_loader.dll"
+            VALUE "OriginalFilename", "tlou_plugin_loader.asi"
             VALUE "ProductName",      "TLOU Plugin Loader"
-            VALUE "ProductVersion",   "v1.0.1"
+            VALUE "ProductVersion",   "v1.1.0"
         END
     END
     BLOCK "VarFileInfo"
@@ -31,3 +31,9 @@ BEGIN
         VALUE "Translation", 0x409, 1200
     END
 END
+
+/* The files the loader writes into Mods\Plugin Loader where the game has
+   none, or an empty one: tlou_plugin_loader.ini (DEFAULT_SETTINGS) and
+   loadorder.txt (DEFAULT_LOAD_ORDER). rc reads both from beside this file. */
+DEFAULT_SETTINGS   RCDATA "tlou_plugin_loader.ini"
+DEFAULT_LOAD_ORDER RCDATA "loadorder.txt"

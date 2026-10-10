@@ -58,9 +58,9 @@ typedef struct {
     int            addDestReg;
     int            storeSrcReg;
 
-    /* The bytes at the site as they were when it was located, captured before
-       the caller patches anything. The cache must record these, not whatever
-       is in memory later. */
+    /* The bytes at the site when it was located, read through the source set
+       by SetOriginalBytesSource, or as memory held them when none is set.
+       The cache must record these, not whatever is in memory later. */
     unsigned char  originalBytes[MAX_SEQ_BYTES];
     int            originalLength;
 } Site;
@@ -80,6 +80,18 @@ void SetLog(LogFn fn);
    <game>\Mods\Cache. */
 void SetCacheFolder(const char *folder);
 
+/* Copies the length bytes starting at address into out, with the caller's
+   patches that the source knows of undone. */
+typedef void (*OriginalBytesFn)(const unsigned char *address, size_t length,
+                                unsigned char *out);
+
+/* Names the source of the bytes the cache works with. Find and
+   FindFunctionByName compare a cache entry with those bytes, Find fills
+   Site.originalBytes with them, and MarkFunctionVerified records them. With
+   none named, they are read from memory as it stands. The searches always
+   read memory as it stands. */
+void SetOriginalBytesSource(OriginalBytesFn fn);
+
 /*
     Locates the function that references the given signature string, for
     example
@@ -89,6 +101,10 @@ void SetCacheFolder(const char *folder);
     name is the key the result is cached under. Returns 1 on success. Returns 0
     after logging the reason, exactly as Find does, and requires the signature
     to appear once and to be referenced from exactly one function.
+
+    The answer is where the function begins. The compiler splits some
+    functions into parts; a reference in a later part answers the start of
+    the function it belongs to, found through the exception directory.
 */
 int FindFunctionByName(const char *name, const char *signature, FunctionSite *out);
 
@@ -96,7 +112,10 @@ int FindFunctionByName(const char *name, const char *signature, FunctionSite *ou
 void MarkFunctionVerified(const char *name, const FunctionSite *site);
 
 /* Returns 1 and fills out on success. Returns 0 after logging the reason and
-   marking the hook disabled. */
+   marking the hook disabled. Must not be called again for a site the caller
+   has patched, unless MarkVerified has recorded it and the source set by
+   SetOriginalBytesSource undoes that patch: otherwise the search reads the
+   patch and can miss the site or answer another one. */
 int Find(const Request *req, Site *out);
 
 /* Call once the hook has executed and confirmed it is operating on the
@@ -116,7 +135,9 @@ int EnableLogOnFire(const char *name);
     The function whose body contains rva, taken from the exception directory of
     the running game module. Returns 1 and fills beginOut and endOut with RVAs.
     Returns 0 when rva is outside every function, which is normal for data and
-    for code the directory does not cover.
+    for code the directory does not cover. In a split function the range is
+    that of the part holding rva, which for a later part is not where the
+    function begins.
 */
 int FunctionContaining(unsigned int rva, unsigned int *beginOut,
                        unsigned int *endOut);

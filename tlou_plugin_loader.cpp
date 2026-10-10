@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <tlhelp32.h>
+#include <psapi.h>
 
 #undef near
 #undef far
@@ -16,7 +17,7 @@
 
 /* The loader's version, for its own log lines. Keep it the same as
    tlou_plugin_loader.rc. */
-#define LOADER_VERSION "v1.0.1"
+#define LOADER_VERSION "v1.1.0"
 
 /* Lines of normal function, used by the beta test (v1.0.1_beta_1): the
    program the loader finds itself in when that is not the game, and how long
@@ -34,9 +35,9 @@
 
 static char global_gameDir[MAX_PATH];
 static char global_modsDir[MAX_PATH];
-static char global_logsDir[MAX_PATH];
-/* The loader's own folder, Mods\Plugin Loader, which is where the DLL lives.
-   Holds tlou_plugin_loader.ini, Logs and Cache. */
+/* The loader's folder for its own files, Mods\Plugin Loader in the game's
+   folder, wherever the loader's own file lies: tlou_plugin_loader.ini,
+   loadorder.txt, its log and the hook finder's hook_cache.ini. */
 static char global_ownFolder[MAX_PATH];
 static char global_logPath[MAX_PATH];
 static char global_iniPath[MAX_PATH];
@@ -55,18 +56,68 @@ static uint32_t global_gameFileVersion[4] = { 0, 0, 0, 0 };
 static CRITICAL_SECTION global_logLock;
 static bool global_logLockReady = false;
 
+/*
+    The log is one file, Mods\Plugin Loader\tlou_plugin_loader.log, newest
+    line first: each line is written above the lines already there, the
+    earlier runs' included. It is at most LOG_MOST_BYTES; the oldest lines,
+    at its end, are left out to keep it there. Each line is written through
+    <log>.new, renamed over the log. global_logBuffer is used only under
+    global_logLock, or before the lock exists, while one thread runs.
+*/
+#define LOG_MOST_BYTES (1024u * 1024u)
+#define LOG_LINE_MOST  4096
+
+static char global_logBuffer[LOG_MOST_BYTES];
+
 static void logRaw(const char* plugin, const char* fmt, va_list ap) {
+    if (!global_logPath[0]) return;
+    char line[LOG_LINE_MOST];
+    SYSTEMTIME st; GetLocalTime(&st);
+    int used = sprintf_s(line, "[%04d-%02d-%02d %02d:%02d:%02d.%03d] ",
+                         st.wYear, st.wMonth, st.wDay,
+                         st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    if (used < 0) return;
+    if (plugin && *plugin) {
+        const int named = sprintf_s(line + used, sizeof(line) - used, "%-20s ",
+                                    plugin);
+        if (named > 0) used += named;
+    }
+    const int text = _vsnprintf_s(line + used, sizeof(line) - used - 1,
+                                  _TRUNCATE, fmt, ap);
+    used = text < 0 ? (int)strlen(line) : used + text;
+    line[used++] = '\n';
+
     if (global_logLockReady) EnterCriticalSection(&global_logLock);
-    FILE* f = nullptr;
-    if (fopen_s(&f, global_logPath, "a") == 0 && f) {
-        SYSTEMTIME st; GetLocalTime(&st);
-        fprintf(f, "[%04d-%02d-%02d %02d:%02d:%02d.%03d] ",
-                st.wYear, st.wMonth, st.wDay,
-                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-        if (plugin && *plugin) fprintf(f, "%-20s ", plugin);
-        vfprintf(f, fmt, ap);
-        fprintf(f, "\n");
-        fclose(f);
+    char* out = global_logBuffer;
+    memcpy(out, line, (size_t)used);
+    size_t total = (size_t)used;
+    const HANDLE old = CreateFileA(global_logPath, GENERIC_READ,
+                                   FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                   FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (old != INVALID_HANDLE_VALUE) {
+        DWORD got = 0;
+        const DWORD room = (DWORD)(LOG_MOST_BYTES - total);
+        if (ReadFile(old, out + total, room, &got, nullptr)) {
+            LARGE_INTEGER size;
+            if (GetFileSizeEx(old, &size) && size.QuadPart > (LONGLONG)got)
+                while (got > 0 && out[total + got - 1] != '\n') --got;
+            total += got;
+        }
+        CloseHandle(old);
+    }
+    char fresh[MAX_PATH];
+    if (sprintf_s(fresh, "%s.new", global_logPath) > 0) {
+        const HANDLE file = CreateFileA(fresh, GENERIC_WRITE, 0, nullptr,
+                                        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                                        nullptr);
+        if (file != INVALID_HANDLE_VALUE) {
+            DWORD wrote = 0;
+            const BOOL ok = WriteFile(file, out, (DWORD)total, &wrote, nullptr)
+                         && wrote == (DWORD)total;
+            CloseHandle(file);
+            if (ok) MoveFileExA(fresh, global_logPath, MOVEFILE_REPLACE_EXISTING);
+            else DeleteFileA(fresh);
+        }
     }
     if (global_logLockReady) LeaveCriticalSection(&global_logLock);
 }
@@ -95,6 +146,461 @@ static int moduleFolder(HMODULE module, char* out, size_t room) {
     char* slash = strrchr(out, '\\');
     if (slash) *slash = 0;
     return 1;
+}
+
+/* --------------------------------------------------- the default settings */
+
+/*
+    The default settings are the RCDATA resource DEFAULT_SETTINGS: the
+    plugin's ini as it stands in the project. Read as an ini, a line [name]
+    opens a section, a line key = value below it is a setting of that
+    section, and a line opening with ; is a comment. The blanks around a name,
+    a key or a value are not part of it. Lines end in CR, LF or CR LF.
+*/
+
+/* The image this code is linked into; its address is its module handle. */
+extern "C" IMAGE_DOS_HEADER __ImageBase;
+
+/* The three bytes of a UTF-8 byte-order mark. */
+static const char utf8ByteOrderMark[] = "\xEF\xBB\xBF";
+
+/* The default settingIsPresent gives GetPrivateProfileStringA. No value in a
+   settings file is this text. */
+static const char missingSettingMark[] = "\x01missing\x01";
+
+/*
+    The RCDATA resource DEFAULT_SETTINGS of module, less a UTF-8 byte-order
+    mark at its start: *length bytes, not ended by a zero. nullptr, with 0 in
+    *length, where module holds no such resource or it holds nothing more.
+*/
+static const char* defaultSettingsText(HMODULE module, DWORD* length) {
+    *length = 0;
+    const HRSRC found = FindResourceA(module, "DEFAULT_SETTINGS",
+                                      (LPCSTR)RT_RCDATA);
+    const HGLOBAL loaded = found ? LoadResource(module, found) : nullptr;
+    const char* text = loaded ? (const char*)LockResource(loaded) : nullptr;
+    if (!text) return nullptr;
+    DWORD size = SizeofResource(module, found);
+    if (size >= 3 && memcmp(text, utf8ByteOrderMark, 3) == 0) {
+        text += 3;
+        size -= 3;
+    }
+    if (!size) return nullptr;
+    *length = size;
+    return text;
+}
+
+/*
+    1 where the settings file at path holds key in section, whatever its
+    value, an empty one included; 0 where Windows reports the key absent
+    (ERROR_FILE_NOT_FOUND, which also stands for no such section and no such
+    file); -1 where the file could not be read, for example while another
+    program holds it open without read sharing (ERROR_SHARING_VIOLATION),
+    with the error in GetLastError.
+*/
+static int settingIsPresent(const char* path, const char* section,
+                            const char* key) {
+    char held[sizeof(missingSettingMark) + 1];
+    SetLastError(0);
+    GetPrivateProfileStringA(section, key, missingSettingMark, held,
+                             (DWORD)sizeof(held), path);
+    const DWORD error = GetLastError();
+    if (strcmp(held, missingSettingMark) != 0) return 1;
+    if (error == ERROR_FILE_NOT_FOUND) return 0;
+    SetLastError(error);
+    return -1;
+}
+
+/* One setting of the default settings: its section, key and value, each
+   without the blanks at its ends. */
+struct DefaultSetting {
+    char section[256];
+    char key[256];
+    char value[512];
+};
+
+/* The text from first up to last, without the blanks at its ends, copied
+   into out with a zero after it. Answers 0, with out empty, where it does not
+   fit in room. */
+static int copyTrimmed(char* out, size_t room, const char* first,
+                       const char* last) {
+    while (first < last && (*first == ' ' || *first == '\t')) ++first;
+    while (last > first && (last[-1] == ' ' || last[-1] == '\t')) --last;
+    out[0] = 0;
+    if ((size_t)(last - first) >= room) return 0;
+    memcpy(out, first, (size_t)(last - first));
+    out[last - first] = 0;
+    return 1;
+}
+
+/*
+    The next setting of the default settings text from *at up to end, read
+    into setting, with *at moved past its line. Answers 0 once no setting is
+    left. setting->section is empty before the first call and then holds the
+    section last opened. A line with no =, a setting before the first section
+    or below a [ line with no ], and a line too long for setting are passed
+    over.
+*/
+static int nextDefaultSetting(const char** at, const char* end,
+                              DefaultSetting* setting) {
+    while (*at < end) {
+        const char* first = *at;
+        const char* last = first;
+        while (last < end && *last != '\r' && *last != '\n') ++last;
+        *at = last;
+        while (*at < end && (**at == '\r' || **at == '\n')) ++*at;
+
+        while (first < last && (*first == ' ' || *first == '\t')) ++first;
+        if (first == last || *first == ';') continue;
+        if (*first == '[') {
+            const char* close = (const char*)memchr(first, ']',
+                                                    (size_t)(last - first));
+            if (!close
+                || !copyTrimmed(setting->section, sizeof(setting->section),
+                                first + 1, close))
+                setting->section[0] = 0;
+            continue;
+        }
+        const char* equals = (const char*)memchr(first, '=',
+                                                 (size_t)(last - first));
+        if (!setting->section[0] || !equals
+            || !copyTrimmed(setting->key, sizeof(setting->key), first, equals)
+            || !setting->key[0]
+            || !copyTrimmed(setting->value, sizeof(setting->value), equals + 1,
+                            last))
+            continue;
+        return 1;
+    }
+    return 0;
+}
+
+/*
+    Adds to the settings file at path each setting of the default settings
+    text (length bytes) that Windows reports absent from it, in its section
+    with its default value, through WritePrivateProfileStringA. A setting the
+    file holds, an empty value included, and every other line of the file
+    are left as they are. Stops at the first setting that cannot be looked up
+    or added, with one line in the log.
+*/
+static void addMissingSettings(const char* path, const char* text,
+                               DWORD length) {
+    const char* at = text;
+    DefaultSetting setting = {};
+    while (nextDefaultSetting(&at, text + length, &setting)) {
+        const int present = settingIsPresent(path, setting.section,
+                                             setting.key);
+        if (present > 0) continue;
+        if (present < 0) {
+            const DWORD error = GetLastError();
+            writeLog("SETTINGS %s could not be read (Windows error %lu), so "
+                     "[%s] %s and the settings after it were not looked up, "
+                     "and those it lacks take their default values", path,
+                     error, setting.section, setting.key);
+            return;
+        }
+        if (!WritePrivateProfileStringA(setting.section, setting.key,
+                                        setting.value, path)) {
+            const DWORD error = GetLastError();
+            writeLog("SETTINGS [%s] %s could not be added to %s (Windows error "
+                     "%lu), so it and the settings after it that the file "
+                     "lacks take their default values", setting.section,
+                     setting.key, path, error);
+            return;
+        }
+    }
+}
+
+/*
+    Gives the settings file at path the default settings built into module:
+    - no file, or an empty one (0 bytes): the text whole, comments included,
+      written to <path>.new, which is flushed, closed and moved to path. The
+      move never replaces a file. An empty file is first deleted, through a
+      handle no other may share, and only while that handle shows it empty;
+      an empty file that cannot be deleted is left as it is. Where a file is
+      at path at the time of the move, the .new file is deleted and the
+      settings that file lacks are added instead.
+    - a file that starts with a UTF-8 byte-order mark: nothing.
+    - any other file: each setting it lacks, added by addMissingSettings.
+    Each failure writes one line to the log; a .new file this wrote is
+    deleted after one.
+*/
+static void writeDefaultSettings(HMODULE module, const char* path) {
+    if (!path || !path[0]) return;
+    DWORD length = 0;
+    const char* const text = defaultSettingsText(module, &length);
+    if (!text) {
+        writeLog("SETTINGS the default settings are not built into this DLL, "
+                 "so none were written to %s", path);
+        return;
+    }
+
+    /* The file's size and first three bytes, read under a shared lock on the
+       whole file, which waits while WritePrivateProfileStringA writes it. */
+    int empty = 0;
+    const HANDLE file = CreateFileA(path, GENERIC_READ,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE
+                                        | FILE_SHARE_DELETE,
+                                    nullptr, OPEN_EXISTING,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        const DWORD error = GetLastError();
+        if (error != ERROR_FILE_NOT_FOUND) {
+            writeLog("SETTINGS %s could not be read (Windows error %lu), so "
+                     "no settings were added to it, and those it lacks take "
+                     "their default values", path, error);
+            return;
+        }
+    } else {
+        OVERLAPPED whole = {};
+        LARGE_INTEGER size = {};
+        char first[3] = {};
+        DWORD got = 0;
+        const BOOL locked = LockFileEx(file, 0, 0, MAXDWORD, MAXDWORD, &whole);
+        const BOOL looked = locked && GetFileSizeEx(file, &size)
+                            && ReadFile(file, first, (DWORD)sizeof(first),
+                                        &got, nullptr);
+        const DWORD error = looked ? ERROR_SUCCESS : GetLastError();
+        if (locked) UnlockFileEx(file, 0, MAXDWORD, MAXDWORD, &whole);
+        CloseHandle(file);
+        if (!looked) {
+            writeLog("SETTINGS %s could not be read (Windows error %lu), so "
+                     "no settings were added to it, and those it lacks take "
+                     "their default values", path, error);
+            return;
+        }
+        if (size.QuadPart > 0) {
+            if (got == sizeof(first)
+                && memcmp(first, utf8ByteOrderMark, sizeof(first)) == 0)
+                writeLog("SETTINGS %s starts with a UTF-8 byte-order mark, "
+                         "which Windows reads as part of its first line, so no "
+                         "settings were added to it", path);
+            else
+                addMissingSettings(path, text, length);
+            return;
+        }
+        empty = 1;
+    }
+
+    char newPath[MAX_PATH];
+    if (_snprintf_s(newPath, sizeof(newPath), _TRUNCATE, "%s.new", path) < 0) {
+        writeLog("SETTINGS %s is too long a path to write the default "
+                 "settings beside it", path);
+        return;
+    }
+    const HANDLE out = CreateFileA(newPath, GENERIC_WRITE, 0, nullptr,
+                                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                                   nullptr);
+    if (out == INVALID_HANDLE_VALUE) {
+        const DWORD error = GetLastError();
+        writeLog("SETTINGS %s could not be made (Windows error %lu), so the "
+                 "default settings were not written to %s", newPath, error,
+                 path);
+        return;
+    }
+    DWORD written = 0;
+    DWORD error = ERROR_SUCCESS;
+    if (!WriteFile(out, text, length, &written, nullptr)) error = GetLastError();
+    else if (written != length) error = ERROR_WRITE_FAULT;
+    else if (!FlushFileBuffers(out)) error = GetLastError();
+    if (!CloseHandle(out) && error == ERROR_SUCCESS) error = GetLastError();
+
+    if (error == ERROR_SUCCESS) {
+        /* Why an empty file at path stays: ERROR_SUCCESS where it was
+           deleted, is gone, or holds something by now. */
+        DWORD kept = ERROR_SUCCESS;
+        if (empty) {
+            const HANDLE old = CreateFileA(path, DELETE | FILE_READ_ATTRIBUTES,
+                                           0, nullptr, OPEN_EXISTING,
+                                           FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (old == INVALID_HANDLE_VALUE) {
+                if (GetLastError() != ERROR_FILE_NOT_FOUND) kept = GetLastError();
+            } else {
+                LARGE_INTEGER size = {};
+                FILE_DISPOSITION_INFO gone = { TRUE };
+                if (GetFileSizeEx(old, &size) && size.QuadPart == 0
+                    && !SetFileInformationByHandle(old, FileDispositionInfo,
+                                                   &gone, (DWORD)sizeof(gone)))
+                    kept = GetLastError();
+                CloseHandle(old);
+            }
+        }
+        if (kept != ERROR_SUCCESS) {
+            DeleteFileA(newPath);
+            writeLog("SETTINGS %s is empty and could not be replaced (Windows "
+                     "error %lu), so the default settings were not written to "
+                     "it, and the settings take their default values", path,
+                     kept);
+            return;
+        }
+        if (MoveFileExA(newPath, path, 0)) return;
+        error = GetLastError();
+    }
+    DeleteFileA(newPath);
+    if (error == ERROR_ALREADY_EXISTS || error == ERROR_FILE_EXISTS) {
+        addMissingSettings(path, text, length);
+        return;
+    }
+    writeLog("SETTINGS the default settings could not be written to %s "
+             "(Windows error %lu), so the settings take their default values",
+             path, error);
+}
+
+/*
+    Reads the open file from its file pointer to its end. Answers 1 where it
+    holds nothing but blanks, tabs and line ends (0 bytes included), 0 where it
+    holds anything else, and -1 where it could not be read, with the Windows
+    error in *error.
+*/
+static int holdsOnlyBlanks(HANDLE file, DWORD* error) {
+    char buffer[4096];
+    for (;;) {
+        DWORD got = 0;
+        if (!ReadFile(file, buffer, sizeof(buffer), &got, nullptr)) {
+            *error = GetLastError();
+            return -1;
+        }
+        if (!got) return 1;
+        for (DWORD i = 0; i < got; ++i)
+            if (buffer[i] != ' ' && buffer[i] != '\t' && buffer[i] != '\r'
+                && buffer[i] != '\n')
+                return 0;
+    }
+}
+
+/*
+    Whether the load order file at path is empty, which counts as missing.
+    Answers 1 where it holds nothing but blanks, tabs and line ends (0 bytes
+    included), 0 where it holds anything else, and -1 where it does not exist
+    or could not be read, with the Windows error in *error
+    (ERROR_FILE_NOT_FOUND where it does not exist).
+*/
+static int loadOrderIsEmpty(const char* path, DWORD* error) {
+    const HANDLE file = CreateFileA(path, GENERIC_READ,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE
+                                        | FILE_SHARE_DELETE,
+                                    nullptr, OPEN_EXISTING,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        *error = GetLastError();
+        return -1;
+    }
+    const int empty = holdsOnlyBlanks(file, error);
+    CloseHandle(file);
+    return empty;
+}
+
+/*
+    Writes the RCDATA resource DEFAULT_LOAD_ORDER of module, less a UTF-8
+    byte-order mark at its start, whole as the file at path where there is no
+    file there or it is empty (nothing but blanks, tabs and line ends, 0 bytes
+    included). The text goes into <path>.new, which is flushed, closed and
+    moved to path; the move never replaces a file. An empty file is first
+    deleted, through a handle no other may share, and only while that handle
+    shows it empty. A file with something in it, one that appeared meanwhile
+    included, is left as it is. Each failure writes one line to the log; a .new
+    file this wrote and did not move is deleted.
+*/
+static void writeDefaultLoadOrder(HMODULE module, const char* path) {
+    const HRSRC found = FindResourceA(module, "DEFAULT_LOAD_ORDER",
+                                      (LPCSTR)RT_RCDATA);
+    const HGLOBAL loaded = found ? LoadResource(module, found) : nullptr;
+    const char* text = loaded ? (const char*)LockResource(loaded) : nullptr;
+    DWORD length = text ? SizeofResource(module, found) : 0;
+    if (length >= 3 && memcmp(text, utf8ByteOrderMark, 3) == 0) {
+        text += 3;
+        length -= 3;
+    }
+    if (!length) {
+        writeLog("the default load order is not built into this DLL, so none "
+                 "was written to %s", path);
+        return;
+    }
+
+    DWORD error = ERROR_SUCCESS;
+    const int empty = loadOrderIsEmpty(path, &error);
+    if (empty == 0) return;
+    if (empty < 0 && error != ERROR_FILE_NOT_FOUND) {
+        writeLog("%s could not be read (Windows error %lu), so the default "
+                 "load order was not written to it", path, error);
+        return;
+    }
+
+    char newPath[MAX_PATH];
+    if (_snprintf_s(newPath, sizeof(newPath), _TRUNCATE, "%s.new", path) < 0) {
+        writeLog("%s is too long a path to write the default load order "
+                 "beside it", path);
+        return;
+    }
+    const HANDLE out = CreateFileA(newPath, GENERIC_WRITE, 0, nullptr,
+                                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                                   nullptr);
+    if (out == INVALID_HANDLE_VALUE) {
+        error = GetLastError();
+        writeLog("%s could not be made (Windows error %lu), so the default "
+                 "load order was not written to %s", newPath, error, path);
+        return;
+    }
+    DWORD written = 0;
+    error = ERROR_SUCCESS;
+    if (!WriteFile(out, text, length, &written, nullptr))
+        error = GetLastError();
+    else if (written != length) error = ERROR_WRITE_FAULT;
+    else if (!FlushFileBuffers(out)) error = GetLastError();
+    if (!CloseHandle(out) && error == ERROR_SUCCESS) error = GetLastError();
+
+    if (error == ERROR_SUCCESS && empty == 1) {
+        const HANDLE old = CreateFileA(path, GENERIC_READ | DELETE, 0, nullptr,
+                                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                                       nullptr);
+        if (old == INVALID_HANDLE_VALUE) {
+            if (GetLastError() != ERROR_FILE_NOT_FOUND) error = GetLastError();
+        } else {
+            FILE_DISPOSITION_INFO gone = { TRUE };
+            const int stillEmpty = holdsOnlyBlanks(old, &error);
+            if (stillEmpty == 0) error = ERROR_ALREADY_EXISTS;
+            else if (stillEmpty == 1
+                     && !SetFileInformationByHandle(old, FileDispositionInfo,
+                                                    &gone, (DWORD)sizeof(gone)))
+                error = GetLastError();
+            CloseHandle(old);
+        }
+    }
+    if (error == ERROR_SUCCESS) {
+        if (MoveFileExA(newPath, path, 0)) return;
+        error = GetLastError();
+    }
+    DeleteFileA(newPath);
+    if (error == ERROR_ALREADY_EXISTS || error == ERROR_FILE_EXISTS) return;
+    writeLog("the default load order could not be written to %s (Windows "
+             "error %lu), so the plugins load in DLL file name order", path,
+             error);
+}
+
+/*
+    Moves Mods\loadorder.txt, where earlier versions of the loader kept the
+    load order, to path, where no file is at path or the file there is empty
+    (nothing but blanks, tabs and line ends, 0 bytes included), and
+    Mods\loadorder.txt is not empty or cannot be read. Only an empty file at
+    path is replaced. A move that fails for any reason but Mods\loadorder.txt
+    not existing writes one line to the log.
+*/
+static void moveOldLoadOrder(const char* path) {
+    char oldPath[MAX_PATH];
+    if (!formatInto(oldPath, sizeof(oldPath), "%s\\loadorder.txt",
+                    global_modsDir))
+        return;
+    DWORD error = ERROR_SUCCESS;
+    const int empty = loadOrderIsEmpty(path, &error);
+    if (empty == 0 || (empty < 0 && error != ERROR_FILE_NOT_FOUND)) return;
+    const int oldEmpty = loadOrderIsEmpty(oldPath, &error);
+    if (oldEmpty == 1 || (oldEmpty < 0 && error == ERROR_FILE_NOT_FOUND))
+        return;
+    if (MoveFileExA(oldPath, path, empty == 1 ? MOVEFILE_REPLACE_EXISTING : 0))
+        return;
+    error = GetLastError();
+    if (error == ERROR_FILE_NOT_FOUND) return;
+    writeLog("the load order %s could not be moved to %s (Windows error %lu), "
+             "so the order it gives is not used", oldPath, path, error);
 }
 
 /* Parses "4D 8B 45 ?? 48" into bytes plus a wildcard mask. Returns the byte
@@ -205,21 +711,19 @@ LOADER_EXPORT uint32_t LoaderGameFileVersion(LoaderHandle, int index) {
 
         LoaderModFolder      Mods\<mod>
         LoaderConfigFolder   the same folder, where the mod's ini lives
-        LoaderLogsFolder     Mods\<mod>\Logs
-        LoaderCacheFolder    Mods\<mod>\Cache
+        LoaderLogsFolder     the same folder, where the mod keeps its log
+        LoaderCacheFolder    the same folder, where the mod keeps any cache
 
-    Logs and Cache are created before Init is called.
+    The loader makes no folder inside a mod's folder.
 */
 static char global_modFolder[MAX_PATH];
-static char global_modLogsDir[MAX_PATH];
-static char global_modCacheDir[MAX_PATH];
 
 LOADER_EXPORT const char* LoaderGameFolder(LoaderHandle)    { return global_gameDir; }
 LOADER_EXPORT const char* LoaderPluginsFolder(LoaderHandle) { return global_modsDir; }
 LOADER_EXPORT const char* LoaderModFolder(LoaderHandle)     { return global_modFolder; }
-LOADER_EXPORT const char* LoaderLogsFolder(LoaderHandle)    { return global_modLogsDir; }
+LOADER_EXPORT const char* LoaderLogsFolder(LoaderHandle)    { return global_modFolder; }
 LOADER_EXPORT const char* LoaderConfigFolder(LoaderHandle)  { return global_modFolder; }
-LOADER_EXPORT const char* LoaderCacheFolder(LoaderHandle)   { return global_modCacheDir; }
+LOADER_EXPORT const char* LoaderCacheFolder(LoaderHandle)   { return global_modFolder; }
 
 /* --------------------------------------------------------- hooking service */
 
@@ -308,6 +812,8 @@ struct HookSubscriber {
     callback        the stub reads this to find the function to call
     returnAddress   the stub jumps here when the callback returns
     name            the name the hook was installed under, or null when free
+    patchBytes      the originalLength bytes written at patchedAt: E9, its
+                    rel32, then 90 up to originalLength
 */
 struct HookSlot {
     uint64_t       stub;
@@ -316,6 +822,7 @@ struct HookSlot {
     const char*    name;
     uint8_t*       patchedAt;
     uint8_t        originalBytes[MAX_DISPLACED];
+    uint8_t        patchBytes[MAX_DISPLACED];
     int            originalLength;
     HookSubscriber subscriber[MAX_SUBSCRIBERS];
     volatile LONG  subscribers;
@@ -368,6 +875,30 @@ static int slotForAddress(const uint8_t* address) {
     return -1;
 }
 
+/* The hooked slot whose patch shares a byte with the length bytes at
+   address, or -1. */
+static int slotOverlapping(const uint8_t* address, int length) {
+    for (int i = 0; i < HOOK_SLOT_COUNT; ++i) {
+        const HookSlot* s = &global_hookSlots[i];
+        if (s->patchedAt && s->patchedAt < address + length
+            && address < s->patchedAt + s->originalLength)
+            return i;
+    }
+    return -1;
+}
+
+/* Writes the refusal line and answers 1 when the length bytes at address
+   share a byte with one of the loader's own jumps; answers 0 otherwise. */
+static int refuseOverlap(const char* name, const uint8_t* address,
+                         int length) {
+    const int overlapped = slotOverlapping(address, length);
+    if (overlapped < 0) return 0;
+    writeLog("hook refused for %s: the %d byte(s) its jump would replace "
+             "overlap the loader's own jump for %s", name, length,
+             global_hookSlots[overlapped].name);
+    return 1;
+}
+
 static int freeSlot() {
     for (int i = 0; i < HOOK_SLOT_COUNT; ++i)
         if (!global_hookSlots[i].patchedAt) return i;
@@ -407,30 +938,271 @@ struct MovedInstruction {
 };
 
 /*
+    Measures the ModRM byte at p[i] and what follows it: a SIB byte, a
+    displacement, then immediate bytes. Records where a rip relative
+    displacement lies. Answers 1.
+*/
+static int measureOperands(const uint8_t* p, int i, int immediate,
+                           MovedInstruction* out) {
+    const uint8_t modrm = p[i++];
+    const int mod = (modrm >> 6) & 3;
+    const int rm  = modrm & 7;
+
+    if (mod != 3) {
+        if (rm == 4) {
+            const uint8_t sib = p[i++];
+            if (mod == 0 && (sib & 7) == 5) i += 4;
+        } else if (mod == 0 && rm == 5) {
+            out->ripDisplacement = i;
+            i += 4;
+        }
+        if (mod == 1) i += 1;
+        else if (mod == 2) i += 4;
+    }
+    i += immediate;
+    out->length = i;
+    return 1;
+}
+
+/*
+    The opcodes known after a VEX prefix (AVX, AVX2, FMA, F16C, BMI1, BMI2,
+    AES, PCLMULQDQ, GFNI and AVX-VNNI), as ranges of the opcode byte from first
+    to last. map is the opcode map the prefix names: 1 for 0F, 2 for 0F 38,
+    3 for 0F 3A. prefixes holds a bit for each value of the prefix's pp field
+    the opcodes are defined with. Every opcode is followed by a ModRM byte,
+    except 0F 77 (vzeroupper, vzeroall), and its operands end with immediate
+    bytes.
+*/
+struct VexOpcodeRange {
+    uint8_t map;
+    uint8_t first;
+    uint8_t last;
+    uint8_t prefixes;
+    uint8_t immediate;
+};
+
+/* The pp field of a VEX prefix, as its bit in prefixes, named by the legacy
+   prefix it stands for. */
+static const uint8_t vexPrefixNone = 1;     /* pp 0 */
+static const uint8_t vexPrefix66   = 2;     /* pp 1 */
+static const uint8_t vexPrefixF3   = 4;     /* pp 2 */
+static const uint8_t vexPrefixF2   = 8;     /* pp 3 */
+static const uint8_t vexPrefixAny  = 15;
+
+static const VexOpcodeRange vexOpcodes[] = {
+    /* vmovups to vmovddup */
+    { 1, 0x10, 0x12, vexPrefixAny, 0 },
+    /* vmovlps, vunpcklps, vunpckhps */
+    { 1, 0x13, 0x15, vexPrefixNone | vexPrefix66, 0 },
+    /* vmovhps, vmovshdup */
+    { 1, 0x16, 0x16, vexPrefixNone | vexPrefix66 | vexPrefixF3, 0 },
+    /* vmovhps store */
+    { 1, 0x17, 0x17, vexPrefixNone | vexPrefix66, 0 },
+    /* vmovaps */
+    { 1, 0x28, 0x29, vexPrefixNone | vexPrefix66, 0 },
+    /* vcvtsi2ss, vcvtsi2sd */
+    { 1, 0x2A, 0x2A, vexPrefixF3 | vexPrefixF2, 0 },
+    /* vmovntps */
+    { 1, 0x2B, 0x2B, vexPrefixNone | vexPrefix66, 0 },
+    /* vcvttss2si, vcvtss2si */
+    { 1, 0x2C, 0x2D, vexPrefixF3 | vexPrefixF2, 0 },
+    /* vucomiss, vcomiss */
+    { 1, 0x2E, 0x2F, vexPrefixNone | vexPrefix66, 0 },
+    /* vmovmskps */
+    { 1, 0x50, 0x50, vexPrefixNone | vexPrefix66, 0 },
+    /* vsqrtps */
+    { 1, 0x51, 0x51, vexPrefixAny, 0 },
+    /* vrsqrtps, vrcpps */
+    { 1, 0x52, 0x53, vexPrefixNone | vexPrefixF3, 0 },
+    /* vandps to vxorps */
+    { 1, 0x54, 0x57, vexPrefixNone | vexPrefix66, 0 },
+    /* vaddps, vmulps, vcvtps2pd */
+    { 1, 0x58, 0x5A, vexPrefixAny, 0 },
+    /* vcvtdq2ps, vcvtps2dq, vcvttps2dq */
+    { 1, 0x5B, 0x5B, vexPrefixNone | vexPrefix66 | vexPrefixF3, 0 },
+    /* vsubps to vmaxps */
+    { 1, 0x5C, 0x5F, vexPrefixAny, 0 },
+    /* vpunpcklbw to vmovd */
+    { 1, 0x60, 0x6E, vexPrefix66, 0 },
+    /* vmovdqa, vmovdqu */
+    { 1, 0x6F, 0x6F, vexPrefix66 | vexPrefixF3, 0 },
+    /* vpshufd, vpshufhw, vpshuflw */
+    { 1, 0x70, 0x70, vexPrefix66 | vexPrefixF3 | vexPrefixF2, 1 },
+    /* shifts by an immediate */
+    { 1, 0x71, 0x73, vexPrefix66, 1 },
+    /* vpcmpeqb to vpcmpeqd */
+    { 1, 0x74, 0x76, vexPrefix66, 0 },
+    /* vzeroupper, vzeroall */
+    { 1, 0x77, 0x77, vexPrefixNone, 0 },
+    /* vhaddpd, vhsubpd */
+    { 1, 0x7C, 0x7D, vexPrefix66 | vexPrefixF2, 0 },
+    /* vmovd, vmovq, vmovdqa store */
+    { 1, 0x7E, 0x7F, vexPrefix66 | vexPrefixF3, 0 },
+    /* vldmxcsr, vstmxcsr */
+    { 1, 0xAE, 0xAE, vexPrefixNone, 0 },
+    /* vcmpps */
+    { 1, 0xC2, 0xC2, vexPrefixAny, 1 },
+    /* vpinsrw, vpextrw */
+    { 1, 0xC4, 0xC5, vexPrefix66, 1 },
+    /* vshufps */
+    { 1, 0xC6, 0xC6, vexPrefixNone | vexPrefix66, 1 },
+    /* vaddsubpd */
+    { 1, 0xD0, 0xD0, vexPrefix66 | vexPrefixF2, 0 },
+    /* vpsrlw to vpmulhw */
+    { 1, 0xD1, 0xE5, vexPrefix66, 0 },
+    /* vcvttpd2dq, vcvtdq2pd, vcvtpd2dq */
+    { 1, 0xE6, 0xE6, vexPrefix66 | vexPrefixF3 | vexPrefixF2, 0 },
+    /* vmovntdq to vpxor */
+    { 1, 0xE7, 0xEF, vexPrefix66, 0 },
+    /* vlddqu */
+    { 1, 0xF0, 0xF0, vexPrefixF2, 0 },
+    /* vpsllw to vpaddd */
+    { 1, 0xF1, 0xFE, vexPrefix66, 0 },
+    /* vpshufb to vtestpd */
+    { 2, 0x00, 0x0F, vexPrefix66, 0 },
+    /* vcvtph2ps */
+    { 2, 0x13, 0x13, vexPrefix66, 0 },
+    /* vpermps, vptest, broadcasts */
+    { 2, 0x16, 0x1A, vexPrefix66, 0 },
+    /* vpabsb to vpabsd */
+    { 2, 0x1C, 0x1E, vexPrefix66, 0 },
+    /* vpmovsx */
+    { 2, 0x20, 0x25, vexPrefix66, 0 },
+    /* vpmuldq to vmaskmovpd */
+    { 2, 0x28, 0x2F, vexPrefix66, 0 },
+    /* vpmovzx to vphminposuw */
+    { 2, 0x30, 0x41, vexPrefix66, 0 },
+    /* vpsrlvd, vpsravd, vpsllvd */
+    { 2, 0x45, 0x47, vexPrefix66, 0 },
+    /* vpdpbusd to vpdpwssds */
+    { 2, 0x50, 0x53, vexPrefix66, 0 },
+    /* vpbroadcastd to vbroadcasti128 */
+    { 2, 0x58, 0x5A, vexPrefix66, 0 },
+    /* vpbroadcastb, vpbroadcastw */
+    { 2, 0x78, 0x79, vexPrefix66, 0 },
+    /* vpmaskmovd load */
+    { 2, 0x8C, 0x8C, vexPrefix66, 0 },
+    /* vpmaskmovd store */
+    { 2, 0x8E, 0x8E, vexPrefix66, 0 },
+    /* gathers */
+    { 2, 0x90, 0x93, vexPrefix66, 0 },
+    /* fused multiply-add, 132 */
+    { 2, 0x96, 0x9F, vexPrefix66, 0 },
+    /* fused multiply-add, 213 */
+    { 2, 0xA6, 0xAF, vexPrefix66, 0 },
+    /* fused multiply-add, 231 */
+    { 2, 0xB6, 0xBF, vexPrefix66, 0 },
+    /* vgf2p8mulb */
+    { 2, 0xCF, 0xCF, vexPrefix66, 0 },
+    /* vaesimc to vaesdeclast */
+    { 2, 0xDB, 0xDF, vexPrefix66, 0 },
+    /* andn, blsr, blsmsk, blsi */
+    { 2, 0xF2, 0xF3, vexPrefixNone, 0 },
+    /* bzhi, pext, pdep */
+    { 2, 0xF5, 0xF5, vexPrefixNone | vexPrefixF3 | vexPrefixF2, 0 },
+    /* mulx */
+    { 2, 0xF6, 0xF6, vexPrefixF2, 0 },
+    /* bextr, shlx, sarx, shrx */
+    { 2, 0xF7, 0xF7, vexPrefixAny, 0 },
+    /* vpermq, vpermpd, vpblendd */
+    { 3, 0x00, 0x02, vexPrefix66, 1 },
+    /* vpermilps, vpermilpd, vperm2f128 */
+    { 3, 0x04, 0x06, vexPrefix66, 1 },
+    /* vroundps to vpalignr */
+    { 3, 0x08, 0x0F, vexPrefix66, 1 },
+    /* vpextrb to vextractf128 */
+    { 3, 0x14, 0x19, vexPrefix66, 1 },
+    /* vcvtps2ph */
+    { 3, 0x1D, 0x1D, vexPrefix66, 1 },
+    /* vpinsrb, vinsertps, vpinsrd */
+    { 3, 0x20, 0x22, vexPrefix66, 1 },
+    /* vinserti128, vextracti128 */
+    { 3, 0x38, 0x39, vexPrefix66, 1 },
+    /* vdpps, vdppd, vmpsadbw */
+    { 3, 0x40, 0x42, vexPrefix66, 1 },
+    /* vpclmulqdq */
+    { 3, 0x44, 0x44, vexPrefix66, 1 },
+    /* vperm2i128 */
+    { 3, 0x46, 0x46, vexPrefix66, 1 },
+    /* vblendvps, vblendvpd, vpblendvb */
+    { 3, 0x4A, 0x4C, vexPrefix66, 1 },
+    /* vpcmpestrm to vpcmpistri */
+    { 3, 0x60, 0x63, vexPrefix66, 1 },
+    /* vgf2p8affineqb, vgf2p8affineinvqb */
+    { 3, 0xCE, 0xCF, vexPrefix66, 1 },
+    /* vaeskeygenassist */
+    { 3, 0xDF, 0xDF, vexPrefix66, 1 },
+    /* rorx */
+    { 3, 0xF0, 0xF0, vexPrefixF2, 1 },
+};
+
+/*
+    Measures the VEX encoded instruction whose prefix byte is p[i]. C5 is
+    followed by one byte (R, vvvv, L, pp) and stands for the map 0F; C4 by
+    two, the first holding R, X, B and the map in its low five bits, the
+    second W, vvvv, L and pp. Answers 0 for a map, opcode or pp not in
+    vexOpcodes.
+*/
+static int decodeVexInstruction(const uint8_t* p, int i,
+                                MovedInstruction* out) {
+    int map = 1;
+    int pp = 0;
+    if (p[i] == 0xC4) {
+        map = p[i + 1] & 0x1F;
+        pp = p[i + 2] & 3;
+        i += 3;
+    } else {
+        pp = p[i + 1] & 3;
+        i += 2;
+    }
+    const uint8_t op = p[i++];
+
+    for (size_t k = 0; k < sizeof(vexOpcodes) / sizeof(vexOpcodes[0]); ++k) {
+        const VexOpcodeRange* range = &vexOpcodes[k];
+        if (range->map != map || op < range->first || op > range->last)
+            continue;
+        if (!(range->prefixes & (1 << pp))) return 0;
+        if (map == 1 && op == 0x77) {
+            out->length = i;
+            return 1;
+        }
+        return measureOperands(p, i, range->immediate, out);
+    }
+    return 0;
+}
+
+/*
     Enough of the x86-64 encoding to measure an instruction's length and find a
     rip relative displacement in it.
 
     Accepts only an instruction that can be moved to another address
     unchanged, or unchanged but for a rip relative displacement the caller
-    rewrites. Relative branches and unknown encodings are refused.
+    rewrites: the general purpose instructions listed below and the VEX
+    encoded ones of vexOpcodes. Relative branches, calls through a register or
+    memory (FF /2 and FF /3) and unknown encodings are refused.
 */
 static int decodeInstruction(const uint8_t* p, MovedInstruction* out) {
     int i = 0;
     out->length = 0;
     out->ripDisplacement = -1;
 
-    /* Legacy prefixes. 0x66 also narrows an immediate from four bytes to two. */
+    /* Legacy prefixes. 0x66 also narrows an immediate from four bytes to two.
+       A VEX prefix after 66, F2, F3 or REX is invalid. */
     int operandSize32 = 1;
+    int vexAllowed = 1;
     for (;;) {
         const uint8_t prefix = p[i];
-        if (prefix == 0x66) { operandSize32 = 0; ++i; continue; }
-        if (prefix == 0x67 || prefix == 0xF2 || prefix == 0xF3
+        if (prefix == 0x66) { operandSize32 = 0; vexAllowed = 0; ++i; continue; }
+        if (prefix == 0xF2 || prefix == 0xF3) { vexAllowed = 0; ++i; continue; }
+        if (prefix == 0x67
             || prefix == 0x2E || prefix == 0x36 || prefix == 0x3E
             || prefix == 0x26 || prefix == 0x64 || prefix == 0x65) {
             ++i; continue;
         }
         break;
     }
+    if (p[i] == 0xC4 || p[i] == 0xC5)
+        return vexAllowed ? decodeVexInstruction(p, i, out) : 0;
     if ((p[i] & 0xF0) == 0x40) {
         if (p[i] & 0x08) operandSize32 = 1;   /* REX.W beats the 0x66 prefix */
         ++i;
@@ -478,7 +1250,11 @@ static int decodeInstruction(const uint8_t* p, MovedInstruction* out) {
             case 0x88: case 0x89: case 0x8A: case 0x8B:  /* mov */
             case 0x8D:                                   /* lea */
             case 0xD0: case 0xD1: case 0xD2: case 0xD3:  /* shift by 1 or cl */
-            case 0xFE: case 0xFF:                        /* inc, dec, push */
+            case 0xFE:                                   /* inc, dec */
+                break;
+            case 0xFF:                                   /* inc, dec, jmp, push */
+                if (((p[i] >> 3) & 7) == 2 || ((p[i] >> 3) & 7) == 3)
+                    return 0;                            /* call, call far */
                 break;
             case 0x80: case 0x83:                        /* group 1, imm8 */
             case 0xC0: case 0xC1:                        /* shift, imm8 */
@@ -501,24 +1277,7 @@ static int decodeInstruction(const uint8_t* p, MovedInstruction* out) {
         }
     }
 
-    const uint8_t modrm = p[i++];
-    const int mod = (modrm >> 6) & 3;
-    const int rm  = modrm & 7;
-
-    if (mod != 3) {
-        if (rm == 4) {
-            const uint8_t sib = p[i++];
-            if (mod == 0 && (sib & 7) == 5) i += 4;
-        } else if (mod == 0 && rm == 5) {
-            out->ripDisplacement = i;
-            i += 4;
-        }
-        if (mod == 1) i += 1;
-        else if (mod == 2) i += 4;
-    }
-    i += immediate;
-    out->length = i;
-    return 1;
+    return measureOperands(p, i, immediate, out);
 }
 
 #define MAX_MOVED 8
@@ -627,6 +1386,7 @@ static int installEntryHook(int slot, const char* name,
                             const FunctionSite* site, int displacedLength) {
     HookSlot* s = &global_hookSlots[slot];
 
+    if (refuseOverlap(name, site->address, displacedLength)) return 0;
     if (site->address[0] == 0xE9) {
         writeLog("hook refused for %s: rva %08X already begins with a jump, so "
                  "something outside the loader is hooked there", name,
@@ -712,12 +1472,44 @@ static int installEntryHook(int slot, const char* name,
     releaseThreads(&held);
 
     VirtualProtect(site->address, span, old, &old);
+    memcpy(s->patchBytes, patch, span);
     s->patchedAt = site->address;
     s->name = name;
     return 1;
 }
 
 static void hookFinderLogSink(const char* text) { writeLog("%s", text); }
+
+/*
+    The hook finder's source for the bytes before the loader's hooks patched
+    them. Copies the length bytes at address into out as memory holds them,
+    then lays each hooked slot's originalBytes over the part of its patch, the
+    originalLength bytes from patchedAt, that falls inside that span. A slot is
+    laid over only while memory still holds its whole patchBytes; a patch
+    written over since, and anything written by LoaderPatch or from outside
+    the loader, is read as memory holds it. installEntryHook refuses a patch
+    that would overlap another, so each byte lies under at most one slot.
+    Holds global_hookLock throughout, so prepareHookSlots must have run first.
+*/
+static void originalBytesAt(const unsigned char* address, size_t length,
+                            unsigned char* out) {
+    EnterCriticalSection(&global_hookLock);
+    memcpy(out, address, length);
+    const uint8_t* end = address + length;
+    for (int i = 0; i < HOOK_SLOT_COUNT; ++i) {
+        const HookSlot* s = &global_hookSlots[i];
+        if (!s->patchedAt) continue;
+        const uint8_t* from = s->patchedAt > address ? s->patchedAt : address;
+        const uint8_t* to = s->patchedAt + s->originalLength;
+        if (to > end) to = end;
+        if (from >= to) continue;
+        if (memcmp(s->patchedAt, s->patchBytes, (size_t)s->originalLength) != 0)
+            continue;
+        for (const uint8_t* p = from; p < to; ++p)
+            out[p - address] = s->originalBytes[p - s->patchedAt];
+    }
+    LeaveCriticalSection(&global_hookLock);
+}
 
 /*
     Hooks the function that carries this signature and calls back on every
@@ -748,6 +1540,10 @@ LOADER_EXPORT int LoaderHookFunction(LoaderHandle, const char* name,
             return 0;
         }
         MarkFunctionVerified(name, &site);
+        if (refuseOverlap(name, site.address, 5)) {
+            LeaveCriticalSection(&global_hookLock);
+            return 0;
+        }
         const int length = firstInstructionLength(site.address);
         if (!length) {
             writeLog("hook refused for %s: the opening instructions cannot be "
@@ -793,7 +1589,9 @@ LOADER_EXPORT int LoaderHookFunction(LoaderHandle, const char* name,
 
     The instruction at address, and as many after it as a five byte jump
     needs, are moved into the slot's resume buffer. A second caller naming the
-    same address is added as a subscriber and nothing is patched twice.
+    same address is added as a subscriber and nothing is patched twice. An
+    address whose moved bytes would overlap another of the loader's jumps is
+    refused.
 
     Returns 1 when the callback is registered.
 */
@@ -813,6 +1611,10 @@ LOADER_EXPORT int LoaderHookAddress(LoaderHandle, const char* name,
         const uint64_t base = (uint64_t)GetModuleHandleW(nullptr);
         site.rva = (unsigned int)(address - base);
 
+        if (refuseOverlap(name, site.address, 5)) {
+            LeaveCriticalSection(&global_hookLock);
+            return 0;
+        }
         const int length = firstInstructionLength(site.address);
         if (!length) {
             writeLog("hook refused for %s: the instruction at rva %08X cannot "
@@ -902,12 +1704,16 @@ LOADER_EXPORT uint64_t LoaderHookTrampoline(LoaderHandle, const char* name) {
 LOADER_EXPORT uint64_t LoaderFindFunction(LoaderHandle, const char* name,
                                           const char* signature) {
     if (!name || !signature) return 0;
+    prepareHookSlots();
+    EnterCriticalSection(&global_hookLock);
     FunctionSite site;
     if (!FindFunctionByName(name, signature, &site)) {
         writeLog("%s was not found", name);
+        LeaveCriticalSection(&global_hookLock);
         return 0;
     }
     MarkFunctionVerified(name, &site);
+    LeaveCriticalSection(&global_hookLock);
     return (uint64_t)site.address;
 }
 
@@ -1260,6 +2066,9 @@ struct Candidate {
 static Candidate global_cand[MAX_PLUGINS];
 static int global_candCount = 0;
 
+/* The file name the loader had as a DLL in Mods\Plugin Loader. */
+static const char loaderDllName[] = "tlou_plugin_loader.dll";
+
 static bool sameName(const char* a, const char* b) {
     return _stricmp(a, b) == 0;
 }
@@ -1338,10 +2147,9 @@ static void discover() {
                  MAX_PLUGINS);
             break;
         }
-        char folder[MAX_PATH], dll[64], longest[MAX_PATH];
+        char folder[MAX_PATH], dll[64];
         if (!formatInto(folder, sizeof(folder), "%s\\%s", global_modsDir,
-                        fd.cFileName)
-            || !formatInto(longest, sizeof(longest), "%s\\Cache", folder)) {
+                        fd.cFileName)) {
             writeLog("the mod folder %s is passed over: its path is longer "
                      "than %u character(s)", fd.cFileName,
                      (unsigned)(MAX_PATH - 1));
@@ -1350,6 +2158,11 @@ static void discover() {
         /* The loader's own folder is not a plugin. */
         if (_stricmp(folder, global_ownFolder) == 0) continue;
         if (!dllInFolder(folder, dll, sizeof(dll))) continue;
+        if (sameName(dll, loaderDllName)) {
+            writeLog("%s in %s is passed over: it is a copy of the plugin "
+                     "loader, not a plugin", dll, fd.cFileName);
+            continue;
+        }
 
         Candidate* c = &global_cand[global_candCount];
         if (!formatInto(c->file, sizeof(c->file), "%s\\%s", folder, dll)) {
@@ -1410,12 +2223,6 @@ static void loadAll() {
         }
 
         formatInto(global_modFolder, sizeof(global_modFolder), "%s", c->folder);
-        formatInto(global_modLogsDir, sizeof(global_modLogsDir), "%s\\Logs",
-                   c->folder);
-        formatInto(global_modCacheDir, sizeof(global_modCacheDir), "%s\\Cache",
-                   c->folder);
-        CreateDirectoryA(global_modLogsDir, nullptr);
-        CreateDirectoryA(global_modCacheDir, nullptr);
 
         if (!init(handle)) writeLog("%-20s Init reported failure", c->name);
     }
@@ -1424,16 +2231,16 @@ static void loadAll() {
 /* --------------------------------------------------------------------------
    The game only
 
-   Windows loads version.dll from the game folder into every program there
-   that imports it, not only into the game. The game's crash reporter,
-   crs-handler.exe, imports it and runs beside the game from a few seconds into
-   every session, so it loaded the loader too, and two minutes later the
-   plugins. The loader now works only in the game's own executables; in any
-   other program it does nothing: it does not move the log aside, watch for
-   crashes, or load plugins.
+   The Ultimate ASI Loader (winmm.dll in the game folder) loads every .asi
+   file into each program in that folder that imports winmm.dll: the game,
+   and also its crash reporter (crs-handler.exe, crs-uploader.exe,
+   crs-video.exe) and launcher.exe. The loader works only in the game's own
+   executables; in any other program it does nothing at all.
    -------------------------------------------------------------------------- */
 
-static const wchar_t* const gamePrograms[] = { L"tlou-i.exe", L"tlou-i-l.exe" };
+/* The executables of The Last of Us Part I and of Part II. */
+static const wchar_t* const gamePrograms[] = { L"tlou-i.exe", L"tlou-i-l.exe",
+                                               L"tlou-ii.exe", L"tlou-ii-l.exe" };
 
 /* The file name of the program this process runs. Empty when it cannot be
    read. */
@@ -1591,24 +2398,18 @@ static DWORD WINAPI noteOtherProgram(LPVOID) {
 /* --------------------------------------------------------------------------
    Loading the plugins at the right point in the game's start
 
-   As version.dll the loader attaches while the game is still starting, before
-   the game's own code runs. A plugin can need the game a certain way into its
-   start: the framework enlarges the game's text cache, which has to exist by
-   then, and adds its entry to the menus, which must not be built yet. When the
-   launcher injected the loader it landed in that window; loading after a fixed
-   wait would land there only on the hardware the wait was timed for.
+   The ASI loader loads the loader on the game's main thread at the game's
+   entry point, before the game's own start-up code runs, and the game waits
+   until DllMain returns: DllMain only sets up and starts the loader's thread.
+   A plugin can need the game a certain way into its start: the framework
+   enlarges the game's text cache, which has to exist by then, and adds its
+   entry to the menus, which must not be built yet; loading after a fixed wait
+   would land there only on the hardware the wait was timed for.
 
-   The loader waits until the game's code is in place - it polls the read-only
-   data for a known signature - and then loads the plugins on its own thread;
-   the loading is heavy, parses menu files and places hooks, and stays off the
+   The loader's thread waits until the game's code is in place - it polls the
+   read-only data for a known signature - and then loads the plugins; the
+   loading is heavy, parses menu files and places hooks, and stays off the
    game's thread. There is no fixed wait, so it holds on any hardware.
-
-   The copy of tlou-i.exe on disk holds its code and this signature in plain
-   form, and in v1.0.1_beta_1's test (2026-10-01) the wait passed at its first
-   check, 0 ms in: nothing decrypts the game's code after it starts. The wait
-   stays as a safety net. Should the signature never appear, it runs out and no
-   plugins are loaded: a plugin's view of the game would be wrong in a process
-   whose code is not the game's.
    -------------------------------------------------------------------------- */
 
 static const char* const listenerUpdateSignature =
@@ -1766,15 +2567,17 @@ static void logSections(const char* lead) {
 }
 
 static DWORD WINAPI start(LPVOID) {
+    /* tlou_plugin_loader.ini and loadorder.txt are put in place in
+       Mods\Plugin Loader before either is read. */
+    writeDefaultSettings(global_selfModule, global_iniPath);
+    moveOldLoadOrder(global_loadorderPath);
+    writeDefaultLoadOrder(global_selfModule, global_loadorderPath);
     if (!describeGame()) { writeLog("could not describe the game module"); return 1; }
 
     SetLog(hookFinderLogSink);
-    char cache[MAX_PATH];
-    if (formatInto(cache, sizeof(cache), "%s\\Cache", global_ownFolder)) {
-        CreateDirectoryA(cache, nullptr);
-        SetCacheFolder(cache);
-    }
+    SetCacheFolder(global_ownFolder);
     prepareHookSlots();
+    SetOriginalBytesSource(originalBytesAt);
 
     /* Wait for the game's code to be in place, then load. */
     if (!waitForGameCode()) {
@@ -1790,73 +2593,96 @@ static DWORD WINAPI start(LPVOID) {
     return 0;
 }
 
-/* The log of the previous run, moved into the Archive folder beside it and
-   named for the time it was last written. */
-static void archiveLog() {
-    WIN32_FILE_ATTRIBUTE_DATA about;
-    if (!GetFileAttributesExA(global_logPath, GetFileExInfoStandard, &about))
-        return;
-    if (!about.nFileSizeLow && !about.nFileSizeHigh) return;
+/*
+    The game's folder, Mods, the loader's folder Mods\Plugin Loader and the
+    paths of the loader's files in them, each built from the folder of the
+    game's program, never from the folder of the loader's own file. Answers 0
+    where a path does not fit in MAX_PATH.
+*/
+static int setPaths() {
+    return moduleFolder(nullptr, global_gameDir, sizeof(global_gameDir))
+        && formatInto(global_modsDir, sizeof(global_modsDir), "%s\\Mods",
+                      global_gameDir)
+        && formatInto(global_ownFolder, sizeof(global_ownFolder),
+                      "%s\\Plugin Loader", global_modsDir)
+        && formatInto(global_loadorderPath, sizeof(global_loadorderPath),
+                      "%s\\loadorder.txt", global_ownFolder)
+        && formatInto(global_logPath, sizeof(global_logPath),
+                      "%s\\tlou_plugin_loader.log", global_ownFolder)
+        && formatInto(global_iniPath, sizeof(global_iniPath),
+                      "%s\\tlou_plugin_loader.ini", global_ownFolder);
+}
 
-    /* The local time the log was written at, with that date's daylight
-       saving offset. */
-    SYSTEMTIME written, when;
-    FileTimeToSystemTime(&about.ftLastWriteTime, &written);
-    if (!SystemTimeToTzSpecificLocalTime(nullptr, &written, &when)) {
-        FILETIME local;
-        FileTimeToLocalFileTime(&about.ftLastWriteTime, &local);
-        FileTimeToSystemTime(&local, &when);
+#define MAX_LISTED_MODULES 1024
+
+/*
+    Another copy of the plugin loader already loaded in this process: a module
+    other than self that exports both LoaderHookFunction and LoaderLog, as
+    every version of the loader does. Answers 1, with that module's path in
+    out (empty where it cannot be read), or 0 where there is none or the list
+    of modules cannot be read.
+*/
+static int otherLoaderCopy(HMODULE self, char* out, size_t room) {
+    out[0] = 0;
+    HMODULE modules[MAX_LISTED_MODULES];
+    DWORD bytes = 0;
+    if (!K32EnumProcessModules(GetCurrentProcess(), modules,
+                               (DWORD)sizeof(modules), &bytes))
+        return 0;
+    DWORD count = bytes / (DWORD)sizeof(HMODULE);
+    if (count > MAX_LISTED_MODULES) count = MAX_LISTED_MODULES;
+    for (DWORD i = 0; i < count; ++i) {
+        if (modules[i] == self) continue;
+        if (!GetProcAddress(modules[i], "LoaderHookFunction")
+            || !GetProcAddress(modules[i], "LoaderLog"))
+            continue;
+        const DWORD length = GetModuleFileNameA(modules[i], out, (DWORD)room);
+        if (length == 0 || length >= room) out[0] = 0;
+        return 1;
     }
-
-    char folder[MAX_PATH], kept[MAX_PATH];
-    if (!formatInto(folder, sizeof(folder), "%s\\Archive", global_logsDir))
-        return;
-    CreateDirectoryA(folder, nullptr);
-    if (!formatInto(kept, sizeof(kept),
-                    "%s\\tlou_plugin_loader_%04u%02u%02u_%02u%02u%02u.log",
-                    folder, when.wYear, when.wMonth, when.wDay, when.wHour,
-                    when.wMinute, when.wSecond))
-        return;
-    MoveFileA(global_logPath, kept);
+    return 0;
 }
 
 BOOL APIENTRY DllMain(HMODULE self, DWORD reason, LPVOID) {
     if (reason != DLL_PROCESS_ATTACH) return TRUE;
+
+    /* In a program that is not the game the loader does nothing at all. */
+    if (!inTheGame()) {
+#if LOADER_BETA_LINES
+        if (setPaths()) {
+            const HANDLE note = CreateThread(nullptr, 0, noteOtherProgram,
+                                             nullptr, 0, nullptr);
+            if (note) CloseHandle(note);
+        }
+#endif
+        return TRUE;
+    }
+
     DisableThreadLibraryCalls(self);
     global_selfModule = self;
 
     /* A path that does not fit in MAX_PATH leaves the game running with no
        plugin loaded and nothing written. */
-    if (!moduleFolder(nullptr, global_gameDir, sizeof(global_gameDir))
-        || !moduleFolder(self, global_ownFolder, sizeof(global_ownFolder))
-        || !formatInto(global_modsDir, sizeof(global_modsDir), "%s\\Mods",
-                       global_gameDir)
-        || !formatInto(global_logsDir, sizeof(global_logsDir), "%s\\Logs",
-                       global_ownFolder)
-        || !formatInto(global_loadorderPath, sizeof(global_loadorderPath),
-                       "%s\\loadorder.txt", global_modsDir)
-        || !formatInto(global_logPath, sizeof(global_logPath),
-                       "%s\\tlou_plugin_loader.log", global_logsDir)
-        || !formatInto(global_iniPath, sizeof(global_iniPath),
-                       "%s\\tlou_plugin_loader.ini", global_ownFolder))
-        return TRUE;
+    if (!setPaths()) return TRUE;
 
-    /* In a program that is not the game - the game's crash reporter - the
-       loader does nothing: no log moved aside, no crash watch, no plugins. */
-    if (!inTheGame()) {
-#if LOADER_BETA_LINES
-        const HANDLE note = CreateThread(nullptr, 0, noteOtherProgram, nullptr,
-                                         0, nullptr);
-        if (note) CloseHandle(note);
-#endif
+    /* A second copy of the loader in the process writes this one line to the
+       log and does nothing else; the copy loaded first runs. */
+    char other[MAX_PATH];
+    if (otherLoaderCopy(self, other, sizeof(other))) {
+        char mine[MAX_PATH];
+        const DWORD length = GetModuleFileNameA(self, mine, MAX_PATH);
+        if (length == 0 || length >= MAX_PATH) mine[0] = 0;
+        writeLog("TLOU Plugin Loader " LOADER_VERSION " at %s does nothing: "
+                 "another copy of the plugin loader, %s, was loaded into the "
+                 "game first and loads the plugins. Remove one of the two",
+                 mine[0] ? mine : "(path not readable)",
+                 other[0] ? other : "(path not readable)");
         return TRUE;
     }
 
     /* Each level must exist before the next can be created. */
     CreateDirectoryA(global_modsDir, nullptr);
     CreateDirectoryA(global_ownFolder, nullptr);
-    CreateDirectoryA(global_logsDir, nullptr);
-    archiveLog();
     InitializeCriticalSection(&global_logLock);
     global_logLockReady = true;
     watchForCrashes();

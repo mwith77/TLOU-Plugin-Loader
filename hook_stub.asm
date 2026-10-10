@@ -1,10 +1,13 @@
 ; Assembled by ml64 into the plugin loader. Each stub is entered from a thunk
-; allocated near the game module, which jumps to it with every register intact;
-; rsp is the game's rsp at the hook site.
+; allocated near the game module, which jumps to it with every register and
+; every flag intact; rsp is the game's rsp at the hook site.
 ;
-; The push order is the SavedRegisters layout the callback reads, and the order
-; of the LOADER_REG_ numbers in tlou_plugin_sdk.h: rax at [rsp+0], r15 at
-; [rsp+70h]. The three must match.
+; The callback is handed the saved block: rax at [block+0] to r15 at
+; [block+70h], in the order of the SavedRegisters layout and of the LOADER_REG_
+; numbers in tlou_plugin_sdk.h. The three must match. The block ends where the
+; game's stack begins: [block+78h] is the qword at the game's rsp, and plugins
+; read the game's stack from there. The flags are kept in the qword below the
+; block.
 ;
 ; Two hundred and fifty six stubs, hookStub00 to hookStub255, each with its own
 ; callback pointer and return address. Names below a hundred have two digits.
@@ -12,6 +15,13 @@
 ;
 ; A stub's return address must point at a buffer holding the bytes the hook
 ; displaced, followed by an absolute jump back past the patch.
+;
+; Across the callbacks a stub keeps the flags as they were at the hook site,
+; ymm0 to ymm15 in full, all 256 bits, and the general registers as the saved
+; block holds them when the callbacks return, so a register a callback writes
+; there is what the game receives. It uses AVX instructions, so it faults on a
+; processor without AVX; both games are compiled for AVX and cannot run on one
+; either.
 
 .DATA
 
@@ -1048,7 +1058,8 @@ HOOK_STUB MACRO stubName:REQ, callbackVar:REQ, returnVar:REQ
 
 stubName PROC
 
-    push    r15
+    pushfq
+    xchg    r15, qword ptr [rsp]    ; r15 to its slot, the flags to r15
     push    r14
     push    r13
     push    r12
@@ -1063,21 +1074,34 @@ stubName PROC
     push    rdx
     push    rcx
     push    rax
+    push    r15                     ; the flags, below the block
 
-    mov     rcx, rsp            ; arg 1: pointer to the saved block
+    lea     rcx, [rsp+8]            ; arg 1: pointer to the saved block
     mov     rbp, rsp
 
     ; rsp must be 16-byte aligned before the call; the incoming alignment is
-    ; not known.
-    and     rsp, -16
-    sub     rsp, 128            ; 32 shadow space + 96 for xmm0-xmm5
+    ; not known. 32 shadow space + 512 for ymm0-ymm15, each at a 32-byte
+    ; aligned place.
+    and     rsp, -32
+    sub     rsp, 544
 
-    movups  xmmword ptr [rsp+32], xmm0
-    movups  xmmword ptr [rsp+48], xmm1
-    movups  xmmword ptr [rsp+64], xmm2
-    movups  xmmword ptr [rsp+80], xmm3
-    movups  xmmword ptr [rsp+96], xmm4
-    movups  xmmword ptr [rsp+112], xmm5
+    vmovdqu ymmword ptr [rsp+32], ymm0
+    vmovdqu ymmword ptr [rsp+64], ymm1
+    vmovdqu ymmword ptr [rsp+96], ymm2
+    vmovdqu ymmword ptr [rsp+128], ymm3
+    vmovdqu ymmword ptr [rsp+160], ymm4
+    vmovdqu ymmword ptr [rsp+192], ymm5
+    vmovdqu ymmword ptr [rsp+224], ymm6
+    vmovdqu ymmword ptr [rsp+256], ymm7
+    vmovdqu ymmword ptr [rsp+288], ymm8
+    vmovdqu ymmword ptr [rsp+320], ymm9
+    vmovdqu ymmword ptr [rsp+352], ymm10
+    vmovdqu ymmword ptr [rsp+384], ymm11
+    vmovdqu ymmword ptr [rsp+416], ymm12
+    vmovdqu ymmword ptr [rsp+448], ymm13
+    vmovdqu ymmword ptr [rsp+480], ymm14
+    vmovdqu ymmword ptr [rsp+512], ymm15
+    vzeroupper
 
     mov     rax, callbackVar
     test    rax, rax
@@ -1085,15 +1109,26 @@ stubName PROC
     call    rax
 noCallback:
 
-    movups  xmm0, xmmword ptr [rsp+32]
-    movups  xmm1, xmmword ptr [rsp+48]
-    movups  xmm2, xmmword ptr [rsp+64]
-    movups  xmm3, xmmword ptr [rsp+80]
-    movups  xmm4, xmmword ptr [rsp+96]
-    movups  xmm5, xmmword ptr [rsp+112]
+    vmovdqu ymm0, ymmword ptr [rsp+32]
+    vmovdqu ymm1, ymmword ptr [rsp+64]
+    vmovdqu ymm2, ymmword ptr [rsp+96]
+    vmovdqu ymm3, ymmword ptr [rsp+128]
+    vmovdqu ymm4, ymmword ptr [rsp+160]
+    vmovdqu ymm5, ymmword ptr [rsp+192]
+    vmovdqu ymm6, ymmword ptr [rsp+224]
+    vmovdqu ymm7, ymmword ptr [rsp+256]
+    vmovdqu ymm8, ymmword ptr [rsp+288]
+    vmovdqu ymm9, ymmword ptr [rsp+320]
+    vmovdqu ymm10, ymmword ptr [rsp+352]
+    vmovdqu ymm11, ymmword ptr [rsp+384]
+    vmovdqu ymm12, ymmword ptr [rsp+416]
+    vmovdqu ymm13, ymmword ptr [rsp+448]
+    vmovdqu ymm14, ymmword ptr [rsp+480]
+    vmovdqu ymm15, ymmword ptr [rsp+512]
 
     mov     rsp, rbp
 
+    pop     r15                     ; the flags
     pop     rax
     pop     rcx
     pop     rdx
@@ -1108,10 +1143,10 @@ noCallback:
     pop     r12
     pop     r13
     pop     r14
-    pop     r15
+    xchg    r15, qword ptr [rsp]    ; r15 from its slot, the flags to it
+    popfq
 
-    ; Absolute jump to the resume buffer, preserving every register and every
-    ; flag.
+    ; Absolute jump to the resume buffer, changing no register and no flag.
     push    rax
     mov     rax, returnVar
     xchg    qword ptr [rsp], rax
